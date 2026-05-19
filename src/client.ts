@@ -166,13 +166,25 @@ export class DeepSeekClient {
     // ignored — we don't strip them here because the server's explicit
     // "setting won't report an error" contract means leaving them in is
     // safe and keeps the request payload diffable against OpenAI tooling.
-    if (opts.thinking) {
+    if (opts.thinking && !this._isAzureEndpoint()) {
       payload.extra_body = { thinking: { type: opts.thinking } };
     }
     if (opts.reasoningEffort) {
       payload.reasoning_effort = opts.reasoningEffort;
     }
     return payload;
+  }
+
+  /** Azure OpenAI-compatible endpoints do not accept DeepSeek's proprietary
+   *  `extra_body.thinking` field (they reject the request with 400).  We still
+   *  send `reasoning_effort`, which Azure *does* support. */
+  private _isAzureEndpoint(): boolean {
+    try {
+      const host = new URL(this.baseUrl).hostname;
+      return host === "azure.com" || host.endsWith(".azure.com");
+    } catch {
+      return false;
+    }
   }
 
   /** Returns null on failure so callers can degrade — session must keep working without balance UI. */

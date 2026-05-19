@@ -361,4 +361,24 @@ describe("R1 reasoning_content round-trip", () => {
     // that don't know it (OpenAI just ignores unknown top-level fields).
     expect(bodies[0]!.reasoning_effort).toBe("max");
   });
+
+  it("skips extra_body for Azure endpoints (issue #1299)", async () => {
+    const { fetch: fakeFetch, bodies } = capturingFetch([{ content: "done" }]);
+    const client = new DeepSeekClient({
+      apiKey: "sk-test",
+      baseUrl: "https://my-project.services.ai.azure.com/openai/v1",
+      fetch: fakeFetch,
+    });
+    const loop = new CacheFirstLoop({
+      client,
+      prefix: new ImmutablePrefix({ system: "s" }),
+      model: "deepseek-v4-pro",
+      stream: false,
+    });
+    for await (const _ev of loop.step("hello")) {
+      /* drain */
+    }
+    expect(bodies[0]!.extra_body).toBeUndefined();
+    expect(bodies[0]!.reasoning_effort).toBe("max");
+  });
 });
