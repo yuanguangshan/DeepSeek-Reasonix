@@ -45,6 +45,8 @@ import type {
   CheckpointVerdict,
   ChoiceVerdict,
   ConfirmationChoice,
+  ExternalSessionApp,
+  ExternalSessionSource,
   IncomingEvent,
   JobInfo,
   McpSpecInfo,
@@ -64,6 +66,7 @@ import { useElapsed } from "./ui/live";
 import { AboutModal } from "./ui/about";
 import { SettingsModal, type PageId as SettingsPageId } from "./ui/settings";
 import { JumpBar } from "./ui/jump-bar";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { Sidebar } from "./ui/sidebar";
 import { Shortcut, localizeShortcutText, shortcutText } from "./ui/shortcut";
 import { Splash, shouldShowSplash } from "./ui/splash";
@@ -99,6 +102,7 @@ import { useResizable } from "./ui/useResizable";
 import { useAutoScroll } from "./ui/useAutoScroll";
 import { useDisableTextAssist } from "./ui/useDisableTextAssist";
 import { getThreadMaxWidth } from "./ui/thread-layout";
+import { elideTranscriptMessages } from "./ui/transcript-elision";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 const RIGHT_SIDEBAR_COLLAPSE_WIDTH = 1120;
@@ -222,6 +226,8 @@ export type UsageStats = {
   lastCallCacheMiss: number | null;
   /** System prompt + tool specs — constant for the session, sent on tab open. */
   reservedTokens: number;
+  /** Current conversation log tokens, refreshed by the desktop sidecar. */
+  liveLogTokens: number;
 };
 
 export type SessionInfo = {
@@ -242,16 +248,33 @@ export type Settings = {
   recentWorkspaces: string[];
   model: string;
   editor?: string;
-  webSearchEngine?: "bing" | "searxng" | "metaso" | "tavily" | "perplexity" | "exa";
+  webSearchEngine?: "bing" | "bing-intl" | "searxng" | "metaso" | "tavily" | "perplexity" | "exa" | "brave" | "ollama";
+  webSearchEndpoint?: string;
+  webSearchApiKeys?: {
+    metaso?: string;
+    tavily?: string;
+    perplexity?: string;
+    exa?: string;
+    ollama?: string;
+    brave?: string;
+  };
   subagentModels?: Record<string, "flash" | "pro">;
   showSystemEvents?: boolean;
   version: string;
+};
+
+export type BalanceInfoItem = {
+  currency: string;
+  total: number;
+  granted?: number;
+  toppedUp?: number;
 };
 
 export type Balance = {
   currency: string;
   total: number;
   isAvailable: boolean;
+  infos: BalanceInfoItem[];
 };
 
 type MentionResults = { nonce: number; query: string; results: string[] };
@@ -278,6 +301,7 @@ type State = {
   activePlan: ActivePlan | null;
   usage: UsageStats;
   sessions: SessionInfo[];
+  externalImportSources: ExternalSessionApp[];
   settings: Settings | null;
   qq: QQDesktopSettingsState | null;
   balance: Balance | null;
@@ -335,6 +359,23 @@ type Action =
   | { t: "settings_patch"; patch: SettingsPatch }
   | { t: "push_status"; text: string };
 
+function sanitizeSettingsPatch(patch: SettingsPatch): Partial<Settings> {
+  const {
+    metasoApiKey: _metaso,
+    tavilyApiKey: _tavily,
+    perplexityApiKey: _perplexity,
+    exaApiKey: _exa,
+    ollamaApiKey: _ollama,
+    webSearchEndpoint,
+    ...rest
+  } = patch;
+  const sanitized: Partial<Settings> = { ...rest };
+  if (webSearchEndpoint !== undefined) {
+    sanitized.webSearchEndpoint = webSearchEndpoint ?? undefined;
+  }
+  return sanitized;
+}
+
 function fallbackSkillDesc(skill: SkillInfo): string {
   const scope =
     skill.scope === "builtin"
@@ -364,6 +405,10 @@ function nextErrorId(): string {
 }
 
 export function reduce(state: State, action: Action): State {
+  return withElidedTranscript(reduceRaw(state, action));
+}
+
+function reduceRaw(state: State, action: Action): State {
   switch (action.t) {
     case "send_user": {
       return {
@@ -413,7 +458,7 @@ export function reduce(state: State, action: Action): State {
       return applyIncoming(state, action.event);
     case "settings_patch":
       return state.settings
-        ? { ...state, settings: { ...state.settings, ...action.patch } }
+        ? { ...state, settings: { ...state.settings, ...sanitizeSettingsPatch(action.patch) } }
         : state;
     case "batch_delta": {
       const collapsed: DeltaBatchItem[] = [];
@@ -543,6 +588,11 @@ export function reduce(state: State, action: Action): State {
     case "push_status":
       return { ...state, messages: [...state.messages, { kind: "status", text: action.text }] };
   }
+}
+
+function withElidedTranscript(state: State): State {
+  const messages = elideTranscriptMessages(state.messages);
+  return messages === state.messages ? state : { ...state, messages };
 }
 
 const READING_TOOLS = new Set(["read_file"]);
@@ -684,6 +734,7 @@ function zeroUsage(): UsageStats {
     lastCallCacheHit: null,
     lastCallCacheMiss: null,
     reservedTokens: 0,
+    liveLogTokens: 0,
   };
 }
 
@@ -700,6 +751,10 @@ function appendTextSegment(
 }
 
 export function applyIncoming(state: State, ev: IncomingEvent): State {
+  return withElidedTranscript(applyIncomingRaw(state, ev));
+}
+
+function applyIncomingRaw(state: State, ev: IncomingEvent): State {
   switch (ev.type) {
     case "user.message": {
       return {
@@ -837,6 +892,23 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
       };
     case "$sessions":
       return { ...state, sessions: ev.items };
+    case "$session_import_sources":
+      return { ...state, externalImportSources: ev.apps };
+    case "$session_import_result":
+      return {
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            kind: "status",
+            text: t("sidebarPanel.importResult", {
+              imported: ev.imported,
+              skipped: ev.skipped,
+              failed: ev.failed,
+            }),
+          },
+        ],
+      };
     case "$mcp_specs":
       return {
         ...state,
@@ -848,10 +920,7 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
     case "$ctx_breakdown": {
       const next: UsageStats = { ...state.usage, reservedTokens: ev.reservedTokens };
       if (typeof ev.logTokens === "number") {
-        next.cacheHitTokens = 0;
-        next.cacheMissTokens = ev.logTokens;
-        next.lastCallCacheHit = 0;
-        next.lastCallCacheMiss = ev.logTokens;
+        next.liveLogTokens = ev.logTokens;
       }
       return { ...state, usage: next };
     }
@@ -875,6 +944,7 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
           currency: ev.currency,
           total: ev.total,
           isAvailable: ev.isAvailable,
+          infos: ev.balanceInfos ?? [],
         },
       };
     case "$qq_settings":
@@ -920,6 +990,8 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
           model: ev.model,
           editor: ev.editor,
           webSearchEngine: ev.webSearchEngine,
+          webSearchEndpoint: ev.webSearchEndpoint,
+          webSearchApiKeys: ev.webSearchApiKeys,
           subagentModels: ev.subagentModels,
           showSystemEvents: ev.showSystemEvents,
           version: ev.version,
@@ -1014,12 +1086,18 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
       // ones so a session full of self-repaired loops doesn't look
       // like everything's on fire (#1456-followup).
       const recoverable = ev.type === "error" ? ev.recoverable : false;
+      // Loop has returned (any error path ends the turn); flip the still-
+      // streaming assistant message to settled so the UI doesn't keep
+      // showing a "thinking" spinner above the error card (#1660).
+      const settled = state.messages.map((m) =>
+        m.kind === "assistant" && m.pending ? { ...m, pending: false } : m,
+      );
       return {
         ...state,
         busy: false,
         activeSkill: null,
         messages: [
-          ...state.messages,
+          ...settled,
           { kind: "error", message: ev.message, id: nextErrorId(), recoverable },
         ],
       };
@@ -1036,118 +1114,106 @@ export function applyIncoming(state: State, ev: IncomingEvent): State {
           { kind: "assistant", turn: ev.turn, segments: [], pending: true },
         ],
       };
-    case "model.delta":
-      return {
-        ...state,
-        messages: state.messages.map((m) => {
-          if (m.kind !== "assistant" || m.turn !== ev.turn) return m;
-          if (ev.channel === "content") {
-            return { ...m, segments: appendTextSegment(m.segments, "text", ev.text) };
-          }
-          if (ev.channel === "reasoning") {
-            return { ...m, segments: appendTextSegment(m.segments, "reasoning", ev.text) };
-          }
-          return m;
-        }),
-      };
+    case "model.delta": {
+      // Walk backwards — streaming always targets the latest assistant message
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        const m = state.messages[i]!;
+        if (m.kind !== "assistant" || m.turn !== ev.turn) continue;
+        let updated = m;
+        if (ev.channel === "content") updated = { ...m, segments: appendTextSegment(m.segments, "text", ev.text) };
+        else if (ev.channel === "reasoning") updated = { ...m, segments: appendTextSegment(m.segments, "reasoning", ev.text) };
+        const next = [...state.messages];
+        next[i] = updated;
+        return { ...state, messages: next };
+      }
+      return state;
+    }
     case "model.final": {
       const u = ev.usage;
+      const promptTokens =
+        u?.prompt_tokens ??
+        (u?.prompt_cache_hit_tokens ?? 0) + (u?.prompt_cache_miss_tokens ?? 0);
       const callHit = u?.prompt_cache_hit_tokens ?? 0;
-      const callMiss = u?.prompt_cache_miss_tokens ?? 0;
-      const hasCall = callHit > 0 || callMiss > 0;
+      const callMiss = u?.prompt_cache_miss_tokens ?? Math.max(0, promptTokens - callHit);
+      const hasCall = promptTokens > 0 || callHit > 0 || callMiss > 0;
       const usage: UsageStats = {
         totalCostUsd: state.usage.totalCostUsd + (ev.costUsd ?? 0),
-        totalPromptTokens: state.usage.totalPromptTokens + (u?.prompt_tokens ?? 0),
+        totalPromptTokens: state.usage.totalPromptTokens + promptTokens,
         totalCompletionTokens: state.usage.totalCompletionTokens + (u?.completion_tokens ?? 0),
         cacheHitTokens: state.usage.cacheHitTokens + callHit,
         cacheMissTokens: state.usage.cacheMissTokens + callMiss,
         lastCallCacheHit: hasCall ? callHit : state.usage.lastCallCacheHit,
         lastCallCacheMiss: hasCall ? callMiss : state.usage.lastCallCacheMiss,
         reservedTokens: state.usage.reservedTokens,
+        liveLogTokens: state.usage.liveLogTokens,
       };
-      return {
-        ...state,
-        usage,
-        messages: state.messages.map((m) => {
-          if (m.kind !== "assistant" || m.turn !== ev.turn) return m;
-          return { ...m, pending: false };
-        }),
-      };
+      // Walk backwards to clear pending flag on the matching assistant
+      let settledPending = false;
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        const m = state.messages[i]!;
+        if (m.kind !== "assistant" || m.turn !== ev.turn) continue;
+        if (m.pending) {
+          const s = [...state.messages];
+          s[i] = { ...m, pending: false };
+          state = { ...state, messages: s };
+        }
+        settledPending = true;
+        break;
+      }
+      return settledPending ? { ...state, usage } : { ...state, usage };
     }
-    case "tool.preparing":
-      return {
-        ...state,
-        messages: state.messages.map((m) => {
-          if (m.kind !== "assistant" || m.turn !== ev.turn) return m;
-          if (m.segments.some((s) => s.kind === "tool" && s.callId === ev.callId)) return m;
-          return {
-            ...m,
-            segments: [
-              ...m.segments,
-              {
-                kind: "tool",
-                callId: ev.callId,
-                name: ev.name,
-                args: "",
-                startedAt: Date.now(),
-              },
-            ],
-          };
-        }),
-      };
+    case "tool.preparing": {
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        const m = state.messages[i]!;
+        if (m.kind !== "assistant" || m.turn !== ev.turn) continue;
+        if (m.segments.some((s) => s.kind === "tool" && s.callId === ev.callId)) return state;
+        const next = [...state.messages];
+        next[i] = { ...m, segments: [...m.segments, { kind: "tool" as const, callId: ev.callId, name: ev.name, args: "", startedAt: Date.now() }] };
+        return { ...state, messages: next };
+      }
+      return state;
+    }
     case "tool.intent": {
       const adds = extractToolFiles(ev.name, ev.args);
-      return {
-        ...state,
-        sessionFiles: mergeSessionFiles(state.sessionFiles, adds),
-        messages: state.messages.map((m) => {
-          if (m.kind !== "assistant" || m.turn !== ev.turn) return m;
-          const idx = m.segments.findIndex((s) => s.kind === "tool" && s.callId === ev.callId);
-          if (idx >= 0) {
-            const segs = [...m.segments];
-            const seg = segs[idx];
-            if (seg?.kind === "tool") {
-              segs[idx] = { ...seg, args: ev.args };
-            }
-            return { ...m, segments: segs };
-          }
-          return {
-            ...m,
-            segments: [
-              ...m.segments,
-              {
-                kind: "tool",
-                callId: ev.callId,
-                name: ev.name,
-                args: ev.args,
-                startedAt: Date.now(),
-              },
-            ],
-          };
-        }),
-      };
+      let nextState = { ...state, sessionFiles: mergeSessionFiles(state.sessionFiles, adds) };
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        const m = state.messages[i]!;
+        if (m.kind !== "assistant" || m.turn !== ev.turn) continue;
+        const idx = m.segments.findIndex((s) => s.kind === "tool" && s.callId === ev.callId);
+        if (idx >= 0) {
+          const segs = [...m.segments];
+          if (segs[idx]?.kind === "tool") segs[idx] = { ...(segs[idx] as AssistantSegment & { kind: "tool" }), args: ev.args };
+          const msgs = [...nextState.messages];
+          msgs[i] = { ...m, segments: segs };
+          nextState = { ...nextState, messages: msgs };
+        } else {
+          const msgs = [...nextState.messages];
+          msgs[i] = { ...m, segments: [...m.segments, { kind: "tool" as const, callId: ev.callId, name: ev.name, args: ev.args, startedAt: Date.now() }] };
+          nextState = { ...nextState, messages: msgs };
+        }
+        break;
+      }
+      return nextState;
     }
-    case "tool.result":
-      return {
-        ...state,
-        messages: state.messages.map((m) => {
-          if (m.kind !== "assistant") return m;
-          let mutated = false;
-          const segs = m.segments.map((s) => {
-            if (s.kind === "tool" && s.callId === ev.callId) {
-              mutated = true;
-              return {
-                ...s,
-                result: ev.output,
-                ok: ev.ok,
-                durationMs: Date.now() - s.startedAt,
-              };
-            }
-            return s;
-          });
-          return mutated ? { ...m, segments: segs } : m;
-        }),
-      };
+    case "tool.result": {
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        const m = state.messages[i]!;
+        if (m.kind !== "assistant") continue;
+        let mutated = false;
+        const segs = m.segments.map((s) => {
+          if (s.kind === "tool" && s.callId === ev.callId) {
+            mutated = true;
+            return { ...s, result: ev.output, ok: ev.ok, durationMs: Date.now() - s.startedAt };
+          }
+          return s;
+        });
+        if (!mutated) continue;
+        const next = [...state.messages];
+        next[i] = { ...m, segments: segs };
+        return { ...state, messages: next };
+      }
+      return state;
+    }
     case "$retry_result":
       return { ...state, retryText: ev.text, retryNonce: state.retryNonce + 1 };
     case "$btw_result":
@@ -1225,11 +1291,6 @@ interface TabRuntimeProps {
   tabId: string;
   active: boolean;
   currency: "CNY" | "USD";
-  pendingUpdate: Update | null;
-  updateStatus: "idle" | "installing" | "error";
-  updateProgress: { downloaded: number; total: number | null } | null;
-  installUpdate: () => void;
-  dismissUpdate: () => void;
   registerDispatch: (tabId: string, d: TabDispatcher | null) => void;
   onNewTab: () => void;
   onCloseTab: () => void;
@@ -1264,11 +1325,6 @@ function TabRuntime({
   tabId,
   active,
   currency,
-  pendingUpdate,
-  updateStatus,
-  updateProgress,
-  installUpdate,
-  dismissUpdate,
   registerDispatch,
   onNewTab,
   onCloseTab,
@@ -1312,6 +1368,7 @@ function TabRuntime({
     activePlan: null,
     usage: zeroUsage(),
     sessions: [],
+    externalImportSources: [],
     settings: null,
     qq: null,
     balance: null,
@@ -1340,6 +1397,7 @@ function TabRuntime({
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const threadInnerRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsPage, setSettingsPage] = useState<SettingsPageId>("general");
   const [jobsOpen, setJobsOpen] = useState(false);
@@ -1592,6 +1650,16 @@ function TabRuntime({
       const skillMatch = text.match(/^\/([a-zA-Z0-9_-]+)(\s+.*)?$/);
       if (skillMatch) {
         const [, name, args] = skillMatch;
+        if (name === "search-engine" || name === "se") {
+          openSettingsAt("general");
+          if (!override) setDraft("");
+          return;
+        }
+        if (name === "skill" || name === "skills") {
+          openSettingsAt("skills");
+          if (!override) setDraft("");
+          return;
+        }
         const skill = state.skills.find((s) => s.name === name);
         if (skill) {
           const clientId = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1617,6 +1685,7 @@ function TabRuntime({
       sendRpc,
       recordAbortDraft,
       applySlashSettingsCommand,
+      openSettingsAt,
     ],
   );
 
@@ -1784,6 +1853,8 @@ function TabRuntime({
   // Read the latest session inside the stable restore callback below.
   const currentSessionRef = useRef(state.currentSession);
   currentSessionRef.current = state.currentSession;
+  const messageItems = state.messages;
+
   const restoreScrollTop = useCallback(() => {
     const session = currentSessionRef.current;
     if (!session) return null;
@@ -1792,7 +1863,8 @@ function TabRuntime({
     return Number.isFinite(n) ? n : null;
   }, []);
 
-  const { showJumpButton, scrollToBottom } = useAutoScroll(
+  const [showJumpButton, setShowJumpButton] = useState(false);
+  const { scrollToBottom } = useAutoScroll(
     threadRef,
     threadInnerRef,
     state.busy,
@@ -1875,6 +1947,32 @@ function TabRuntime({
         if (settingsOpen || aboutOpen || jobsOpen || wdOpen) return;
         e.preventDefault();
         abort();
+      } else if (e.key === "Enter" && !mod && !e.shiftKey && !e.altKey) {
+        // Defer to any control that already handles Enter — native inputs/buttons,
+        // ARIA button/link widgets (sidebar rows, file pills), or anything that called
+        // preventDefault — so we only grant when focus is on inert layout (#2015).
+        if (e.defaultPrevented) return;
+        const target = e.target as HTMLElement | null;
+        if (
+          target?.isContentEditable ||
+          target?.closest('input, textarea, button, select, a, [role="button"], [role="link"]')
+        ) {
+          return;
+        }
+        if (settingsOpen || aboutOpen || jobsOpen || wdOpen) return;
+        // Enter grants the pending authorization prompt (run once), matching the
+        // TUI where Enter confirms the highlighted choice (#1962).
+        const confirm = state.pendingConfirms.at(-1);
+        if (confirm) {
+          e.preventDefault();
+          resolveConfirm(confirm.id, { type: "run_once" });
+          return;
+        }
+        const pathAccess = state.pendingPathAccess.at(-1);
+        if (pathAccess) {
+          e.preventDefault();
+          resolvePathAccess(pathAccess.id, { type: "run_once" });
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1882,6 +1980,10 @@ function TabRuntime({
   }, [
     active,
     state.busy,
+    state.pendingConfirms,
+    state.pendingPathAccess,
+    resolveConfirm,
+    resolvePathAccess,
     abort,
     newChat,
     settingsOpen,
@@ -1972,6 +2074,13 @@ function TabRuntime({
       },
     },
     { cmd: "/model", desc: t("app.cmd.switchModel"), run: () => openSettingsAt("models") },
+    {
+      cmd: "/search-engine",
+      desc: t("app.cmd.searchEngine"),
+      run: () => openSettingsAt("general"),
+    },
+    { cmd: "/skill", desc: t("app.cmd.skill"), run: () => openSettingsAt("skills") },
+    { cmd: "/skills", desc: t("app.cmd.skill"), run: () => openSettingsAt("skills") },
     ...slashSettingCommands,
     { cmd: "/theme", desc: t("app.cmd.toggleTheme"), run: onToggleTheme },
     {
@@ -2151,7 +2260,9 @@ function TabRuntime({
 
         <Sidebar
           sessions={state.sessions}
+          importSources={state.externalImportSources}
           activeName={state.currentSession}
+          workspaceDir={state.settings?.workspaceDir}
           onNewChat={newChat}
           onLoadSession={(name) => {
             clearAbortDraft();
@@ -2159,6 +2270,17 @@ function TabRuntime({
           }}
           onDeleteSession={(name) => sendRpc({ cmd: "session_delete", name })}
           onRenameSession={(name, title) => sendRpc({ cmd: "session_rename", name, title })}
+          onRefreshImportSources={() => sendRpc({ cmd: "session_import_scan" })}
+          onImportDetectedSessions={(sources: ExternalSessionSource[]) =>
+            sendRpc({ cmd: "session_import_bulk", sources })
+          }
+          onImportSession={({ source, path, name }) =>
+            sendRpc({ cmd: "session_import", source, path, ...(name ? { name } : {}) })
+          }
+          onOpenWorkdir={(anchor) => {
+            setWdAnchor(anchor);
+            setWdOpen(true);
+          }}
           onOpenSettings={() => openSettingsAt("general")}
           onOpenRules={() => openSettingsAt("rules")}
           onOpenCommands={() => palette.setOpen(true)}
@@ -2200,197 +2322,70 @@ function TabRuntime({
                 }}
               />
               <div className="thread" ref={threadRef}>
-                <div className="thread-inner" ref={threadInnerRef}>
-                  {pendingUpdate ? (
-                    <UpdateBanner
-                      version={pendingUpdate.version}
-                      currentVersion={pendingUpdate.currentVersion}
-                      status={updateStatus}
-                      progress={updateProgress}
-                      onInstall={installUpdate}
-                      onDismiss={dismissUpdate}
-                    />
-                  ) : null}
-
-                  {state.activePlan ? (
-                    <>
-                      <PlanBanner
-                        plan={state.activePlan}
-                        onDismiss={state.busy ? undefined : () => dispatch({ t: "dismiss_plan" })}
-                      />
-                      <ActivePlanTaskCard plan={state.activePlan} />
-                    </>
-                  ) : null}
-
-                  {state.messages.length === 0 ? (
+                {state.messages.length === 0 ? (
+                  <div className="thread-inner thread-inner--standalone">
                     <EmptyState
                       onPick={(text) => {
                         const trimmed = text.trim();
                         if (trimmed.startsWith("/")) {
                           const cmd = trimmed.split(/\s+/)[0] ?? "";
                           const match = slashCommands.find((s) => s.cmd === cmd);
-                          if (match) {
-                            match.run();
-                            return;
-                          }
+                          if (match) { match.run(); return; }
                         }
                         send(text);
                       }}
                       workspaceDir={state.settings?.workspaceDir}
                     />
-                  ) : null}
-
-                  {state.messages.map((m, i) => {
-                    if (m.kind === "user") {
-                      const dividerLabel = `turn ${m.turn}`;
-                      const prev = state.messages[i - 1];
-                      const needsDivider = !prev || prev.kind === "user";
-                      return (
-                        <div key={`u-${i}`} data-turn={m.turn}>
-                          {needsDivider ? <TurnDivider label={dividerLabel} /> : null}
-                          <UserMsg text={m.text} skill={m.skill} onEdit={onEditUserMsg} />
-                        </div>
-                      );
-                    }
-                    if (m.kind === "assistant") {
-                      const stats = !m.pending ? countFileStats(m.segments) : null;
-                      return (
-                        <div key={`a-${m.turn}`}>
-                          <AssistantMsg
-                            segments={m.segments}
-                            pending={m.pending}
-                            model={state.model}
-                            onApproveConfirm={onApproveConfirm}
-                            onRejectConfirm={onRejectConfirm}
-                            onAlwaysAllowConfirm={onAlwaysAllowConfirm}
-                            pendingConfirms={state.pendingConfirms}
+                  </div>
+                ) : (
+                  <Virtuoso
+                    ref={virtuosoRef}
+                    style={{ height: "100%" }}
+                    totalCount={messageItems.length}
+                    followOutput={"auto"}
+                    atBottomStateChange={(atBottom) => setShowJumpButton(!atBottom)}
+                    components={{
+                      Header: state.activePlan ? () => (
+                        <div className="thread-inner">
+                          <PlanBanner
+                            plan={state.activePlan!}
+                            onDismiss={state.busy ? undefined : () => dispatch({ t: "dismiss_plan" })}
                           />
-                          {stats ? <DiffStats stats={stats} /> : null}
+                          <ActivePlanTaskCard plan={state.activePlan!} />
                         </div>
-                      );
-                    }
-                    if (m.kind === "error") {
-                      const toneVar = m.recoverable ? "var(--tone-warn)" : "var(--tone-err)";
-                      const bgVar = m.recoverable
-                        ? "var(--warn-soft, var(--danger-soft))"
-                        : "var(--danger-soft)";
-                      const labelKey = m.recoverable ? "app.warningLabel" : "app.errorLabel";
-                      return (
-                        <div
-                          key={m.id}
-                          className="warn-card"
-                          style={{ borderColor: toneVar, background: bgVar, position: "relative" }}
-                        >
-                          <span className="ico" style={{ color: toneVar }}>
-                            <I.warning size={16} />
-                          </span>
-                          <div style={{ flex: 1 }}>
-                            <div className="tt">{t(labelKey)}</div>
-                            <div className="ds">{m.message}</div>
+                      ) : undefined,
+                    }}
+                    itemContent={(index) => {
+                      const m = state.messages[index]!;
+                      if (m.kind === "user") {
+                        return (
+                          <div className="thread-inner" data-turn={m.turn}>
+                            <TurnDivider label={`turn ${m.turn}`} />
+                            <UserMsg text={m.text} skill={m.skill} onEdit={onEditUserMsg} />
                           </div>
-                          <button
-                            type="button"
-                            className="warn-card-dismiss"
-                            title={t("app.dismissError")}
-                            onClick={() => dispatch({ t: "dismiss_error", id: m.id })}
-                            style={{
-                              background: "transparent",
-                              border: "none",
-                              color: toneVar,
-                              cursor: "pointer",
-                              padding: "4px",
-                              alignSelf: "flex-start",
-                            }}
-                          >
-                            <I.x size={14} />
-                          </button>
-                        </div>
-                      );
-                    }
-                    if (m.kind === "warning") {
-                      if (state.settings?.showSystemEvents === false) return null;
-                      return (
-                        <div key={m.id} className="sys-event-row" title={m.text}>
-                          <span className="line" />
-                          <span className="label">{m.text}</span>
-                          <span className="line" />
-                        </div>
-                      );
-                    }
-                    return null;
-                  })}
-
-                  {/* Pending approvals */}
-                  {state.pendingPlans.map((p) => (
-                    <PlanApprovalCard
-                      key={`pp-${p.id}`}
-                      p={p}
-                      onApprove={() => resolvePlan(p.id, { type: "approve" })}
-                      onRefine={() => resolvePlan(p.id, { type: "refine" })}
-                      onCancel={() => resolvePlan(p.id, { type: "cancel" })}
-                    />
-                  ))}
-                  {state.pendingCheckpoints.map((c) => (
-                    <CheckpointApprovalCard
-                      key={`cp-${c.id}`}
-                      c={c}
-                      onContinue={() => resolveCheckpoint(c.id, { type: "continue" })}
-                      onRevise={() => resolveCheckpoint(c.id, { type: "revise" })}
-                      onStop={() => resolveCheckpoint(c.id, { type: "stop" })}
-                    />
-                  ))}
-                  {state.pendingRevisions.map((r) => (
-                    <RevisionApprovalCard
-                      key={`rv-${r.id}`}
-                      r={r}
-                      onAccept={() => resolveRevision(r.id, { type: "accepted" })}
-                      onReject={() => resolveRevision(r.id, { type: "rejected" })}
-                    />
-                  ))}
-                  {state.pendingConfirms.map((c) => (
-                    <ConfirmApprovalCard
-                      key={`cc-${c.id}`}
-                      prompt={c.prompt}
-                      onAllow={() => resolveConfirm(c.id, { type: "run_once" })}
-                      onAlwaysAllow={(prefix) =>
-                        resolveConfirm(c.id, { type: "always_allow", prefix })
+                        );
                       }
-                      onDeny={() => resolveConfirm(c.id, { type: "deny" })}
-                    />
-                  ))}
-                  {state.pendingPathAccess.map((p) => (
-                    <PathAccessApprovalCard
-                      key={`pa-${p.id}`}
-                      prompt={p.prompt}
-                      onAllow={() => resolvePathAccess(p.id, { type: "run_once" })}
-                      onAlwaysAllow={(prefix) =>
-                        resolvePathAccess(p.id, { type: "always_allow", prefix })
+                      if (m.kind === "assistant") {
+                        const stats = !m.pending ? countFileStats(m.segments) : null;
+                        return (
+                          <div className="thread-inner">
+                            <AssistantMsg
+                              segments={m.segments}
+                              pending={m.pending}
+                              model={state.model}
+                              onApproveConfirm={onApproveConfirm}
+                              onRejectConfirm={onRejectConfirm}
+                              onAlwaysAllowConfirm={onAlwaysAllowConfirm}
+                              pendingConfirms={state.pendingConfirms}
+                            />
+                            {stats ? <DiffStats stats={stats} /> : null}
+                          </div>
+                        );
                       }
-                      onDeny={() => resolvePathAccess(p.id, { type: "deny" })}
-                    />
-                  ))}
-                  {state.pendingChoices.map((c) => (
-                    <ChoiceApprovalCard
-                      key={`ch-${c.id}`}
-                      c={c}
-                      onPick={(optionId) => resolveChoice(c.id, { type: "pick", optionId })}
-                      onCancel={() => resolveChoice(c.id, { type: "cancel" })}
-                    />
-                  ))}
-
-                  {!state.ready ? (
-                    <div
-                      style={{
-                        padding: 12,
-                        color: "var(--muted)",
-                        fontFamily: "Geist Mono, monospace",
-                        fontSize: 11,
-                      }}
-                    >
-                      {t("app.connecting")}
-                    </div>
-                  ) : null}
-                </div>
+                      return null;
+                    }}
+                  />
+                )}
                 {showJumpButton ? (
                   <button
                     className="thread-jump-bottom"
@@ -2402,6 +2397,18 @@ function TabRuntime({
                   </button>
                 ) : null}
               </div>
+
+              {state.pendingPlans.length > 0 || state.pendingCheckpoints.length > 0 || state.pendingRevisions.length > 0 || state.pendingConfirms.length > 0 || state.pendingPathAccess.length > 0 || state.pendingChoices.length > 0 || !state.ready ? (
+                <div style={{ maxWidth: "var(--thread-max-width, 740px)", margin: "0 auto", padding: "0 32px", width: "100%" }}>
+                  {state.pendingPlans.map((p) => (<PlanApprovalCard key={`pp-${p.id}`} p={p} onApprove={() => resolvePlan(p.id, { type: "approve" })} onRefine={() => resolvePlan(p.id, { type: "refine" })} onCancel={() => resolvePlan(p.id, { type: "cancel" })} />))}
+                  {state.pendingCheckpoints.map((c) => (<CheckpointApprovalCard key={`cp-${c.id}`} c={c} onContinue={() => resolveCheckpoint(c.id, { type: "continue" })} onRevise={() => resolveCheckpoint(c.id, { type: "revise" })} onStop={() => resolveCheckpoint(c.id, { type: "stop" })} />))}
+                  {state.pendingRevisions.map((r) => (<RevisionApprovalCard key={`rv-${r.id}`} r={r} onAccept={() => resolveRevision(r.id, { type: "accepted" })} onReject={() => resolveRevision(r.id, { type: "rejected" })} />))}
+                  {state.pendingConfirms.map((c) => (<ConfirmApprovalCard key={`cc-${c.id}`} prompt={c.prompt} onAllow={() => resolveConfirm(c.id, { type: "run_once" })} onAlwaysAllow={(prefix) => resolveConfirm(c.id, { type: "always_allow", prefix })} onDeny={() => resolveConfirm(c.id, { type: "deny" })} />))}
+                  {state.pendingPathAccess.map((p) => (<PathAccessApprovalCard key={`pa-${p.id}`} prompt={p.prompt} onAllow={() => resolvePathAccess(p.id, { type: "run_once" })} onAlwaysAllow={(prefix) => resolvePathAccess(p.id, { type: "always_allow", prefix })} onDeny={() => resolvePathAccess(p.id, { type: "deny" })} />))}
+                  {state.pendingChoices.map((c) => (<ChoiceApprovalCard key={`ch-${c.id}`} c={c} onPick={(optionId) => resolveChoice(c.id, { type: "pick", optionId })} onCancel={() => resolveChoice(c.id, { type: "cancel" })} />))}
+                  {!state.ready ? (<div style={{ padding: 12, color: "var(--muted)", fontFamily: "Geist Mono, monospace", fontSize: 11 }}>{t("app.connecting")}</div>) : null}
+                </div>
+              ) : null}
 
               <Composer
                 draft={draft}
@@ -2502,6 +2509,10 @@ function TabRuntime({
             saveSettings({ workspaceDir: path });
           }}
           onBrowse={pickWorkspace}
+          onRemoveRecent={(path) => {
+            const nextRecent = (state.settings?.recentWorkspaces ?? []).filter((p) => p !== path);
+            applySettingsPatch({ recentWorkspaces: nextRecent });
+          }}
         />
 
         {aboutOpen ? <AboutModal onClose={() => setAboutOpen(false)} /> : null}
@@ -3112,7 +3123,7 @@ function NeedsSetupView({
   );
 }
 
-function UpdateBanner({
+function UpdateOverlay({
   version,
   currentVersion,
   status,
@@ -3149,31 +3160,30 @@ function UpdateBanner({
           : t("app.update.installing")
         : t("app.update.clickToInstall");
   return (
-    <div
-      className="plan-banner"
-      style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}
-    >
-      <span className="ico">
-        <I.download size={14} />
-      </span>
-      <div className="body">
-        <div className="t">
-          {t("app.update.available", { current: currentVersion, latest: version })}
-        </div>
-        <div className="s">{statusText}</div>
-        {status === "installing" && ratio !== null ? (
-          <div className="meter-mini" aria-label="download progress">
-            <span style={{ width: `${Math.round(ratio * 100)}%` }} />
+    <div className="update-overlay" aria-live="polite">
+      <div className="plan-banner update-overlay-card">
+        <span className="ico">
+          <I.download size={14} />
+        </span>
+        <div className="body">
+          <div className="t">
+            {t("app.update.available", { current: currentVersion, latest: version })}
           </div>
-        ) : null}
-      </div>
-      <div className="prog">
-        <button type="button" onClick={onInstall} disabled={status === "installing"}>
-          {t("app.update.install")}
-        </button>
-        <button type="button" onClick={onDismiss} disabled={status === "installing"}>
-          {t("app.update.later")}
-        </button>
+          <div className="s">{statusText}</div>
+          {status === "installing" && ratio !== null ? (
+            <div className="meter-mini" aria-label="download progress">
+              <span style={{ width: `${Math.round(ratio * 100)}%` }} />
+            </div>
+          ) : null}
+        </div>
+        <div className="prog">
+          <button type="button" onClick={onInstall} disabled={status === "installing"}>
+            {t("app.update.install")}
+          </button>
+          <button type="button" onClick={onDismiss} disabled={status === "installing"}>
+            {t("app.update.later")}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -3262,6 +3272,13 @@ export function App() {
     localStorage.setItem("reasonix.theme", theme);
     localStorage.setItem("reasonix.themeStyle", themeStyle);
   }, [theme, themeStyle]);
+
+  // Sync --composer-max-width to .app (separate from inline style to avoid React override)
+  const composerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!composerRef.current) composerRef.current = document.querySelector(".app");
+    composerRef.current?.style.setProperty("--composer-max-width", `${threadMaxWidth}px`);
+  }, [threadMaxWidth]);
 
   useEffect(() => {
     let raf = 0;
@@ -3650,11 +3667,6 @@ export function App() {
           tabId={t.id}
           active={t.id === activeTabId}
           currency={currency}
-          pendingUpdate={pendingUpdate}
-          updateStatus={updateStatus}
-          updateProgress={updateProgress}
-          installUpdate={installUpdate}
-          dismissUpdate={() => setPendingUpdate(null)}
           registerDispatch={registerDispatch}
           onNewTab={openTab}
           onCloseTab={() => closeTab(t.id)}
@@ -3685,6 +3697,16 @@ export function App() {
           setActiveTabId={setActiveTabId}
         />
       ))}
+      {pendingUpdate ? (
+        <UpdateOverlay
+          version={pendingUpdate.version}
+          currentVersion={pendingUpdate.currentVersion}
+          status={updateStatus}
+          progress={updateProgress}
+          onInstall={installUpdate}
+          onDismiss={() => setPendingUpdate(null)}
+        />
+      ) : null}
     </>
   );
 }

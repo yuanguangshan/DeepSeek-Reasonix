@@ -15,7 +15,9 @@ import { InflightSet } from "./core/inflight.js";
 import { t } from "./i18n/index.js";
 import { dispatchToolCallsChunked } from "./loop/dispatch.js";
 import {
+  errorMeta,
   formatLoopError,
+  is4xxError,
   is5xxError,
   isDeepSeekHost,
   probeDeepSeekReachable,
@@ -51,6 +53,7 @@ import {
   loadSessionMeta,
   patchSessionMeta,
   rewriteSession,
+  sessionPath,
 } from "./memory/session.js";
 import { type RepairReport, ToolCallRepair } from "./repair/index.js";
 import { SessionStats, type TurnStats } from "./telemetry/stats.js";
@@ -124,7 +127,7 @@ export class CacheFirstLoop {
   readonly client: DeepSeekClient;
   readonly prefix: ImmutablePrefix;
   readonly tools: ToolRegistry;
-  readonly log = new AppendOnlyLog();
+  readonly log: AppendOnlyLog;
   readonly scratch = new VolatileScratch();
   readonly stats = new SessionStats();
   readonly repair: ToolCallRepair;
@@ -199,6 +202,10 @@ export class CacheFirstLoop {
     this.client = opts.client;
     this.prefix = opts.prefix;
     this.tools = opts.tools ?? new ToolRegistry();
+    this.sessionName = opts.session ?? null;
+    this.log = new AppendOnlyLog({
+      sessionPath: this.sessionName ? sessionPath(this.sessionName) : undefined,
+    });
     this.model = opts.model ?? "deepseek-v4-flash";
     this.reasoningEffort = opts.reasoningEffort ?? "high";
     this.budgetUsd =
@@ -229,7 +236,6 @@ export class CacheFirstLoop {
     });
 
     // Heal-on-load: oversized tool results would 400 the next call before the user types.
-    this.sessionName = opts.session ?? null;
     if (this.sessionName) {
       const prior = loadSessionMessages(this.sessionName);
       const shrunk = healLoadedMessagesByTokens(prior, DEFAULT_MAX_RESULT_TOKENS);
@@ -240,7 +246,7 @@ export class CacheFirstLoop {
       const messages = pruned.messages;
       const healedCount = shrunk.healedCount + stamped.stampedCount;
       const tokensSaved = shrunk.tokensSaved;
-      for (const msg of messages) this.log.append(msg);
+      this.log.initWindow(messages);
       this.resumedMessageCount = messages.length;
       this._turn = messages.reduce((n, m) => (m.role === "assistant" ? n + 1 : n), 0);
       // Carry forward cumulative cost / turn count so the TUI's session
@@ -515,7 +521,7 @@ export class CacheFirstLoop {
   }
 
   private healActiveLogBeforeSend(): ChatMessage[] {
-    const current = this.log.toMessages();
+    const current = this.log.toFullHistory();
     const healed = healLoadedMessages(current, DEFAULT_MAX_RESULT_CHARS);
     const argsShrunk = shrinkOversizedToolCallArgsByTokens(
       healed.messages,
@@ -547,7 +553,10 @@ export class CacheFirstLoop {
   }
 
   private discardLogFrom(index: number): void {
-    const preserved = this.log.entries.slice(0, index).map((m) => ({ ...m }));
+    const preserved = this.log
+      .toFullHistory()
+      .slice(0, index)
+      .map((m) => ({ ...m }));
     this.log.compactInPlace(preserved);
     if (this.sessionName) {
       try {
@@ -560,7 +569,7 @@ export class CacheFirstLoop {
 
   /** Drop the last user message + everything after; caller re-sends. Persists to session file. */
   retryLastUser(): string | null {
-    const entries = this.log.entries;
+    const entries = this.log.toFullHistory();
     let lastUserIdx = -1;
     for (let i = entries.length - 1; i >= 0; i--) {
       if (entries[i]!.role === "user") {
@@ -585,7 +594,7 @@ export class CacheFirstLoop {
 
   /** Rewind to the N-th user turn (0-indexed). Drops that turn + everything after. */
   rewindToUserTurn(userTurnIndex: number): string | null {
-    const entries = this.log.entries;
+    const entries = this.log.toFullHistory();
     let count = 0;
     let targetIdx = -1;
     for (let i = 0; i < entries.length; i++) {
@@ -622,14 +631,21 @@ export class CacheFirstLoop {
     if (this.budgetUsd !== null) {
       const spent = this.stats.totalCost;
       if (spent >= this.budgetUsd) {
+        const message = t("loop.budgetExhausted", {
+          spent: spent.toFixed(4),
+          cap: this.budgetUsd.toFixed(2),
+        });
         yield {
           turn: this._turn,
           role: "error",
           content: "",
-          error: t("loop.budgetExhausted", {
-            spent: spent.toFixed(4),
-            cap: this.budgetUsd.toFixed(2),
-          }),
+          error: message,
+          errorDetail: {
+            name: "BudgetExhausted",
+            message,
+            retryable: false,
+            recoverable: false,
+          },
         };
         this._steerQueue.length = 0;
         return;
@@ -849,11 +865,22 @@ export class CacheFirstLoop {
         const dsHost = isDeepSeekHost(upstreamHost);
         const probe =
           is5xxError(err) && dsHost ? await probeDeepSeekReachable(this.client) : undefined;
+        const cause = err instanceof Error ? err : new Error(String(err));
+        const retryable = !is4xxError(cause) && cause.name !== "AbortError";
+        const { code, phase } = errorMeta(cause);
         yield {
           turn: this._turn,
           role: "error",
           content: "",
           error: formatLoopError(err as Error, probe, { upstreamHost }),
+          errorDetail: {
+            name: cause.name,
+            message: cause.message,
+            phase,
+            code,
+            retryable,
+            recoverable: false,
+          },
         };
         this._steerQueue.length = 0;
         return;
@@ -1031,6 +1058,7 @@ export class CacheFirstLoop {
       appendAndPersist: (m) => this.appendAndPersist(m),
       recordStats: (model, usage) => this.stats.record(this._turn, model, usage),
       turn: this._turn,
+      model: this.model,
     };
   }
 

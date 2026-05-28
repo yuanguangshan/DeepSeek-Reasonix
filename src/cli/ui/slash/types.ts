@@ -3,6 +3,7 @@ import type { EditMode } from "../../../config.js";
 import type { McpServerSummary } from "../../../mcp/summary.js";
 import type { JobRegistry } from "../../../tools/jobs.js";
 import type { PlanStep } from "../../../tools/plan.js";
+import type { CodeUndoOutput } from "../undo-context.js";
 
 export type { McpServerSummary } from "../../../mcp/summary.js";
 
@@ -58,12 +59,12 @@ export interface SlashResult {
   };
 }
 
-export type PlanModeToggleSource = "slash";
+export type PlanModeToggleSource = "slash" | "explicit-intent";
 
 export interface SlashContext {
   configPath?: string;
   mcpSpecs?: string[];
-  codeUndo?: (args: readonly string[]) => string;
+  codeUndo?: (args: readonly string[]) => CodeUndoOutput;
   codeApply?: (indices?: readonly number[]) => string;
   codeDiscard?: (indices?: readonly number[]) => string;
   codeHistory?: () => string;

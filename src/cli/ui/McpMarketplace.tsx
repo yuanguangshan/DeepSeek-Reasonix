@@ -2,7 +2,7 @@
 
 import { Box, Text } from "ink";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { readConfig, writeConfig } from "../../config.js";
+import { normalizeMcpConfig, readConfig, writeConfig } from "../../config.js";
 import { t } from "../../i18n/index.js";
 import { loadOverlay } from "../../mcp/marketplace-overlay/loader.js";
 import {
@@ -96,7 +96,11 @@ function isInstalled(installedSpecs: string[], entry: RegistryEntry): string | n
   if (!entry.install) return null;
   try {
     const spec = specStringFor(entry.name, entry.install);
-    return installedSpecs.includes(spec) ? spec : null;
+    if (installedSpecs.includes(spec)) return spec;
+    // Also check for name collision with mcpServers entries
+    const normalized = normalizeMcpConfig(readConfig());
+    if (normalized.some((s) => s.name === entry.name)) return spec;
+    return null;
   } catch {
     return null;
   }
@@ -360,18 +364,18 @@ export function McpMarketplace({ onClose, postInfo, reloadMcp, pickerPorts }: Mc
         <Text bold color={COLOR.brand}>
           ◈ MCP marketplace
         </Text>
-        <Text dimColor>{`  ·  ${state.status}`}</Text>
+        <Text dim>{`  ·  ${state.status}`}</Text>
       </Box>
       <Box marginTop={1}>
         <Text>{t("mcpMarketplace.filter")}</Text>
         <Text>{state.query || t("mcpMarketplace.filterPlaceholder")}</Text>
         <Text
-          dimColor
+          dim
         >{`  ${t(filtered.length === 1 ? "mcpMarketplace.matchSingular" : "mcpMarketplace.matchPlural", { n: filtered.length })}`}</Text>
       </Box>
       <Box marginTop={1} flexDirection="column">
         {window.length === 0 ? (
-          <Text dimColor>
+          <Text dim>
             {state.loading ? t("mcpMarketplace.loading") : t("mcpMarketplace.noEntries")}
           </Text>
         ) : (
@@ -387,7 +391,7 @@ export function McpMarketplace({ onClose, postInfo, reloadMcp, pickerPorts }: Mc
               <Box key={e.name}>
                 <Text color={active ? COLOR.brand : undefined}>{active ? "▸ " : "  "}</Text>
                 <Text bold={active}>{e.name.padEnd(38).slice(0, 38)}</Text>
-                <Text dimColor>{` ${tag}${pop}${installedBadge}`}</Text>
+                <Text dim>{` ${tag}${pop}${installedBadge}`}</Text>
               </Box>
             );
           })
@@ -397,15 +401,13 @@ export function McpMarketplace({ onClose, postInfo, reloadMcp, pickerPorts }: Mc
         <Box marginTop={1} flexDirection="column">
           <Text bold>
             {overlay?.[selected.name]?.title ?? selected.title}
-            {overlay?.[selected.name] ? (
-              <Text dimColor>{`  \u00b7  ${selected.title}`}</Text>
-            ) : null}
+            {overlay?.[selected.name] ? <Text dim>{`  \u00b7  ${selected.title}`}</Text> : null}
           </Text>
-          <Text dimColor>
+          <Text dim>
             {overlay?.[selected.name]?.description ?? selected.description?.slice(0, 200) ?? null}
           </Text>
           {selected.install ? (
-            <Text dimColor>
+            <Text dim>
               {t("mcpMarketplace.specLine", {
                 runtime: selected.install.runtime,
                 id: selected.install.packageId ?? selected.install.url ?? "\u2014",
@@ -413,17 +415,17 @@ export function McpMarketplace({ onClose, postInfo, reloadMcp, pickerPorts }: Mc
               })}
             </Text>
           ) : (
-            <Text dimColor>{t("mcpMarketplace.smitheryDetail")}</Text>
+            <Text dim>{t("mcpMarketplace.smitheryDetail")}</Text>
           )}
           {selected.install?.requiredEnv?.length ? (
-            <Text color="yellow">
+            <Text color="ansi:yellow">
               {t("mcpMarketplace.needsEnv", { env: selected.install.requiredEnv.join(", ") })}
             </Text>
           ) : null}
         </Box>
       ) : null}
       <Box marginTop={1}>
-        <Text dimColor>{t("mcpMarketplace.footerHint")}</Text>
+        <Text dim>{t("mcpMarketplace.footerHint")}</Text>
       </Box>
     </Box>
   );

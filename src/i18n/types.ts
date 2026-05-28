@@ -1,4 +1,4 @@
-export type LanguageCode = "EN" | "zh-CN" | "de";
+export type LanguageCode = "EN" | "zh-CN" | "de" | "ru" | "ja";
 
 export interface TranslationSchema {
   common: {
@@ -227,6 +227,7 @@ export interface TranslationSchema {
     continuingAfter: string;
     planStoppedAt: string;
     revisingAfter: string;
+    explicitPlanIntentArmed: string;
     historyScrollHint: string;
     editHistoryTitle: string;
     editHistoryNoCodeMode: string;
@@ -725,6 +726,21 @@ export interface TranslationSchema {
     exaRateLimit: string;
     exaServerError: string;
     exaParseError: string;
+    braveMissingKey: string;
+    braveUnauthorized: string;
+    braveRateLimit: string;
+    braveServerError: string;
+    braveParseError: string;
+    ollamaMissingKey: string;
+    ollamaUnauthorized: string;
+    ollamaRateLimit: string;
+    ollamaServerError: string;
+    ollamaParseError: string;
+    fetchOllamaMissingKey: string;
+    fetchOllamaUnauthorized: string;
+    fetchOllamaRateLimit: string;
+    fetchOllamaServerError: string;
+    fetchOllamaParseError: string;
     fetchStatus: string;
     fetchRateLimit429: string;
     fetchForbidden403: string;
@@ -947,6 +963,7 @@ export interface TranslationSchema {
     review: string;
     securityReview: string;
     test: string;
+    qq: string;
   };
   shortcutsHelp: {
     title: string;

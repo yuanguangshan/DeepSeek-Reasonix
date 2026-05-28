@@ -23,18 +23,25 @@ import {
   isPlausibleKey,
   isReasoningEffort,
   loadApiKey,
+  loadBraveApiKey,
   loadDesktopOpenTabs,
   loadEditMode,
   loadEditor,
   loadEndpoint,
+  loadExaApiKey,
+  loadMetasoApiKey,
   loadModel,
+  loadOllamaApiKey,
+  loadPerplexityApiKey,
   loadQQConfig,
   loadReasoningEffort,
   loadRecentWorkspaces,
   loadResolvedSkillPaths,
   loadShowSystemEvents,
   loadSubagentModels,
+  loadTavilyApiKey,
   loadWorkspaceDir,
+  normalizeMcpConfig,
   pushRecentWorkspace,
   readConfig,
   webSearchEngine as readWebSearchEngine,
@@ -69,6 +76,11 @@ import {
   readMemoryEntryDetail,
 } from "../../desktop/memory-browser.js";
 import {
+  parseQQRemoteDesktopCommand,
+  qqRemoteCommandBypassesBusy,
+  qqRemoteDesktopHelpText,
+} from "../../desktop/qq-remote-commands.js";
+import {
   loadDesktopQQState,
   saveDesktopQQSettings,
   setDesktopQQEnabled,
@@ -83,8 +95,14 @@ import {
   takeQQPendingInteraction,
 } from "../../desktop/qq-turn-routing.js";
 import { loadDotenv } from "../../env.js";
-import { CacheFirstLoop, DeepSeekClient, ImmutablePrefix } from "../../index.js";
-import { parseMcpSpec } from "../../mcp/spec.js";
+import { type ResolvedHook, formatHookOutcomeMessage, loadHooks, runHooks } from "../../hooks.js";
+import {
+  CacheFirstLoop,
+  DeepSeekClient,
+  ImmutablePrefix,
+  type LoopAbortOptions,
+} from "../../index.js";
+import { parseMcpSpec, specToRaw } from "../../mcp/spec.js";
 import {
   deleteSession,
   listSessionsForWorkspace,
@@ -96,6 +114,12 @@ import {
   timestampSuffix,
 } from "../../memory/session.js";
 import { QQChannel } from "../../qq/channel.js";
+import {
+  type ExternalSessionSource,
+  discoverExternalSessionApps,
+  importExternalSession,
+  importExternalSessions,
+} from "../../session-import.js";
 import { SkillStore } from "../../skills.js";
 import { countTokensBounded } from "../../tokenizer.js";
 import type { ChoiceOption } from "../../tools/choice.js";
@@ -110,6 +134,11 @@ export interface DesktopOptions {
   dir?: string;
 }
 
+export function desktopUserAbortLoopOptions(): LoopAbortOptions | undefined {
+  // User-facing Abort stops generation; it must not erase a prompt that remains visible in chat.
+  return undefined;
+}
+
 type InMessage = { tabId?: string } & (
   | { cmd: "user_input"; text: string }
   | { cmd: "abort" }
@@ -122,6 +151,9 @@ type InMessage = { tabId?: string } & (
   | { cmd: "session_delete"; name: string }
   | { cmd: "session_load"; name: string }
   | { cmd: "session_rename"; name: string; title: string }
+  | { cmd: "session_import"; source: ExternalSessionSource; path: string; name?: string }
+  | { cmd: "session_import_scan" }
+  | { cmd: "session_import_bulk"; sources: ExternalSessionSource[] }
   | { cmd: "memory_read"; path: string }
   | { cmd: "new_chat" }
   | { cmd: "setup_save_key"; key: string }
@@ -133,9 +165,26 @@ type InMessage = { tabId?: string } & (
       budgetUsd?: number | null;
       baseUrl?: string;
       workspaceDir?: string;
+      recentWorkspaces?: string[];
       model?: string;
       editor?: string;
-      webSearchEngine?: "bing" | "searxng" | "metaso" | "tavily" | "perplexity" | "exa";
+      webSearchEngine?:
+        | "bing"
+        | "bing-intl"
+        | "searxng"
+        | "metaso"
+        | "tavily"
+        | "perplexity"
+        | "exa"
+        | "brave"
+        | "ollama";
+      webSearchEndpoint?: string | null;
+      metasoApiKey?: string | null;
+      tavilyApiKey?: string | null;
+      perplexityApiKey?: string | null;
+      exaApiKey?: string | null;
+      ollamaApiKey?: string | null;
+      braveApiKey?: string | null;
       subagentModels?: Record<string, "flash" | "pro">;
       showSystemEvents?: boolean;
     }
@@ -184,7 +233,24 @@ interface SettingsEvent {
   recentWorkspaces: string[];
   model: string;
   editor?: string;
-  webSearchEngine?: "bing" | "searxng" | "metaso" | "tavily" | "perplexity" | "exa";
+  webSearchEngine?:
+    | "bing"
+    | "bing-intl"
+    | "searxng"
+    | "metaso"
+    | "tavily"
+    | "perplexity"
+    | "exa"
+    | "brave"
+    | "ollama";
+  webSearchEndpoint?: string;
+  webSearchApiKeys?: {
+    metaso?: string;
+    tavily?: string;
+    perplexity?: string;
+    exa?: string;
+    ollama?: string;
+  };
   subagentModels?: Record<string, "flash" | "pro">;
   showSystemEvents?: boolean;
   version: string;
@@ -203,11 +269,19 @@ interface QQSettingsEvent {
   access: string;
 }
 
+interface BalanceInfoItem {
+  currency: string;
+  total: number;
+  granted?: number;
+  toppedUp?: number;
+}
+
 interface BalanceEvent {
   type: "$balance";
   currency: string;
   total: number;
   isAvailable: boolean;
+  balanceInfos: BalanceInfoItem[];
 }
 
 interface PlanRequiredEvent {
@@ -227,6 +301,18 @@ interface SessionsEvent {
     summary?: string;
     workspaceStatus?: "matched" | "legacy_missing_meta";
   }[];
+}
+
+interface SessionImportSourcesEvent {
+  type: "$session_import_sources";
+  apps: ReturnType<typeof discoverExternalSessionApps>;
+}
+
+interface SessionImportResultEvent {
+  type: "$session_import_result";
+  imported: number;
+  skipped: number;
+  failed: number;
 }
 
 interface MentionResultsEvent {
@@ -462,6 +548,8 @@ type EmittableEvent =
   | StepCompletedEvent
   | PlanClearedEvent
   | SessionsEvent
+  | SessionImportSourcesEvent
+  | SessionImportResultEvent
   | SessionLoadedEvent
   | SessionEmptyEvent
   | NeedsSetupEvent
@@ -490,6 +578,11 @@ const SESSION_TITLE_MAX_CHARS = 200;
 /** Trim + cap a user-provided session title; empty string means "clear summary". Exported for tests. */
 export function normalizeSessionTitle(raw: string): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, SESSION_TITLE_MAX_CHARS);
+}
+
+/** Return all MCP specs as raw strings, reading both legacy `cfg.mcp` and canonical `cfg.mcpServers`. */
+export function getAllMcpSpecs(cfg: ReturnType<typeof readConfig>): string[] {
+  return normalizeMcpConfig(cfg).map(specToRaw);
 }
 
 /** Drain `buffer` to `fd` across partial writes; retry EAGAIN after a 5 ms park. Exported for tests. */
@@ -531,7 +624,7 @@ function tailLines(s: string, n: number): string {
   return lines.slice(-n).join("\n");
 }
 
-const LOADED_RECENT_MESSAGE_WINDOW = 200;
+const LOADED_RECENT_MESSAGE_WINDOW = 120;
 const LOADED_MIN_ELIDE_CHARS = 4096;
 const LOADED_ELIDED_PREFIX = "[elided — older than the last ";
 
@@ -615,6 +708,30 @@ export function buildLoadedMessages(records: ChatMessage[]): LoadedMessage[] {
   return elideLoadedMessages(out);
 }
 
+function maskApiKey(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  if (key.length <= 7) return `${key.slice(0, 2)}…`;
+  return `${key.slice(0, 6)}…${key.slice(-3)}`;
+}
+
+function collectWebSearchApiKeyPrefixes(): {
+  metaso?: string;
+  tavily?: string;
+  perplexity?: string;
+  exa?: string;
+  ollama?: string;
+  brave?: string;
+} {
+  return {
+    metaso: maskApiKey(loadMetasoApiKey()),
+    tavily: maskApiKey(loadTavilyApiKey()),
+    perplexity: maskApiKey(loadPerplexityApiKey()),
+    exa: maskApiKey(loadExaApiKey()),
+    ollama: maskApiKey(loadOllamaApiKey()),
+    brave: maskApiKey(loadBraveApiKey()),
+  };
+}
+
 function emitSettings(tab: Tab): void {
   const ep = loadEndpoint();
   const editMode = loadEditMode();
@@ -633,6 +750,8 @@ function emitSettings(tab: Tab): void {
       model: tab.currentModel,
       editor: loadEditor(),
       webSearchEngine: readWebSearchEngine(),
+      webSearchEndpoint: readConfig().webSearchEndpoint,
+      webSearchApiKeys: collectWebSearchApiKeyPrefixes(),
       subagentModels: loadSubagentModels(),
       showSystemEvents: loadShowSystemEvents(),
       version: VERSION,
@@ -660,12 +779,19 @@ async function emitBalance(tab: Tab): Promise<void> {
   if (!bal) return;
   const primary = pickPrimaryBalance(bal.balance_infos);
   if (!primary) return;
+  const balanceInfos = bal.balance_infos.map((info) => ({
+    currency: info.currency,
+    total: Number(info.total_balance),
+    granted: info.granted_balance ? Number(info.granted_balance) : undefined,
+    toppedUp: info.topped_up_balance ? Number(info.topped_up_balance) : undefined,
+  }));
   emit(
     {
       type: "$balance",
       currency: primary.currency,
       total: Number(primary.total_balance),
       isAvailable: bal.is_available,
+      balanceInfos,
     },
     tab.id,
   );
@@ -684,6 +810,57 @@ function emitSessions(tab: Tab): void {
   } catch (err) {
     emit({ type: "$error", message: `session_list failed: ${(err as Error).message}` }, tab.id);
   }
+}
+
+function loadSessionIntoTab(
+  tab: Tab,
+  name: string,
+  actions: {
+    abortTurn: (tab: Tab) => void;
+    cancelPendingGates: (tab: Tab) => void;
+    persistOpenTabs: () => void;
+  },
+): void {
+  const records = loadSessionMessages(name);
+  const backfilledWorkspace = patchSessionWorkspaceIfMissing(name, tab.rootDir);
+  const meta = loadSessionMeta(name);
+  // Only set switching flag when there's a live turn to abort —
+  // otherwise the flag stays true and suppresses the first turn's events (#1217).
+  if (tab.aborter) tab.switching = true;
+  actions.abortTurn(tab);
+  actions.cancelPendingGates(tab);
+  tab.currentSession = name;
+  actions.persistOpenTabs();
+  if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+  const loadedMessages = buildLoadedMessages(records);
+  if (loadedMessages.length === 0) {
+    let sizeBytes = 0;
+    try {
+      sizeBytes = statSync(sessionPath(name)).size;
+    } catch {
+      /* file may not exist */
+    }
+    process.stderr.write(
+      `session_load: "${name}" returned 0 messages (file size=${sizeBytes}B) — empty or unreadable jsonl\n`,
+    );
+    emit({ type: "$session_empty", name, sizeBytes }, tab.id);
+  }
+  emit(
+    {
+      type: "$session_loaded",
+      name,
+      messages: loadedMessages,
+      carryover: {
+        totalCostUsd: meta.totalCostUsd ?? 0,
+        cacheHitTokens: meta.cacheHitTokens ?? 0,
+        cacheMissTokens: meta.cacheMissTokens ?? 0,
+        totalCompletionTokens: meta.totalCompletionTokens ?? 0,
+      },
+    },
+    tab.id,
+  );
+  emitCtxBreakdown(tab);
+  if (backfilledWorkspace) emitSessions(tab);
 }
 
 function summarizeMcpSpec(raw: string): McpSpecInfo {
@@ -721,7 +898,8 @@ function summarizeMcpSpec(raw: string): McpSpecInfo {
 
 function emitMcpSpecs(tab: Tab): void {
   const cfg = readConfig();
-  const specs = (cfg.mcp ?? []).map((raw) => {
+  const allSpecs = getAllMcpSpecs(cfg);
+  const specs = allSpecs.map((raw) => {
     const base = summarizeMcpSpec(raw);
     const live = tab.mcpStatuses.get(raw);
     if (!live) return base;
@@ -740,19 +918,33 @@ function emitMemory(tab: Tab): void {
   }
 }
 
+function countTokensForMeter(text: string): number {
+  try {
+    return countTokensBounded(text);
+  } catch {
+    return text.length === 0 ? 0 : Math.max(1, Math.ceil(text.length * 0.3));
+  }
+}
+
 // reserved = system prompt + tool specs, constant for the tab's lifetime once
-// the loop is built. The growing log portion is already covered by the
-// per-turn cache hit/miss numbers in `model.final`.
+// the loop is built. logTokens is refreshed during turns so Desktop doesn't
+// show a fake zero while the streaming call is still waiting on usage metadata.
 function emitCtxBreakdown(tab: Tab): void {
   if (!tab.runtime) return;
+  const sys = countTokensForMeter(tab.runtime.loop.prefix.system);
+  const tools = countTokensForMeter(JSON.stringify(tab.runtime.loop.prefix.toolSpecs));
+  let logTokens = 0;
   try {
-    const sys = countTokensBounded(tab.runtime.loop.prefix.system);
-    const tools = countTokensBounded(JSON.stringify(tab.runtime.loop.prefix.toolSpecs));
-    const logTokens = tab.runtime.loop.getCurrentLogTokens();
-    emit({ type: "$ctx_breakdown", reservedTokens: sys + tools, logTokens }, tab.id);
+    logTokens = tab.runtime.loop.getCurrentLogTokens();
   } catch {
-    // tokenizer warmup can throw on first call before the data file loads
+    for (const msg of tab.runtime.loop.log.toFullHistory()) {
+      logTokens += countTokensForMeter(typeof msg.content === "string" ? msg.content : "");
+      if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        logTokens += countTokensForMeter(JSON.stringify(msg.tool_calls));
+      }
+    }
   }
+  emit({ type: "$ctx_breakdown", reservedTokens: sys + tools, logTokens }, tab.id);
 }
 
 function emitSkills(tab: Tab): void {
@@ -816,6 +1008,7 @@ interface Tab {
   mcpStatuses: Map<string, { kind: McpSpecStatus; reason?: string; toolCount?: number }>;
   /** True while a session switch is in progress — prevents stale events from the old turn. */
   switching: boolean;
+  hooks: ResolvedHook[];
 }
 
 let tabCounter = 0;
@@ -850,6 +1043,8 @@ function buildRuntimeFor(tab: Tab): RuntimeState {
     budgetUsd: tab.budgetUsd,
     session: tab.currentSession,
     reasoningEffort,
+    hooks: tab.hooks,
+    hookCwd: tab.rootDir,
   });
   const eventizer = new Eventizer();
   const ctx = { model: tab.currentModel, prefixHash: prefix.fingerprint, reasoningEffort };
@@ -1018,8 +1213,8 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     broadcastQQSettings();
   }
 
-  function sendQQInfo(message: string): void {
-    const tab = activeDesktopTab();
+  function sendQQInfo(message: string, tabOverride?: Tab): void {
+    const tab = tabOverride ?? activeDesktopTab();
     if (tab) {
       emit(
         {
@@ -1038,6 +1233,145 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
         emit({ type: "$error", message: `qq send failed: ${(err as Error).message}` }, active.id);
       }
     });
+  }
+
+  function startNewChatInTab(tab: Tab): void {
+    if (tab.aborter) tab.switching = true;
+    abortTurn(tab);
+    cancelPendingGates(tab);
+    tab.currentSession = mintSessionFor(tab.rootDir);
+    persistOpenTabs();
+    if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+    emitSessions(tab);
+  }
+
+  function buildSkillPayload(tab: Tab, name: string, args?: string): string | null {
+    const store = new SkillStore({
+      projectRoot: tab.rootDir,
+      customSkillPaths: loadResolvedSkillPaths(tab.rootDir),
+    });
+    const found = store.read(name);
+    if (!found) return null;
+    const extra = args?.trim() ?? "";
+    const header = `# Skill: ${found.name}${found.description ? `\n> ${found.description}` : ""}`;
+    const argsLine = extra ? `\n\nArguments: ${extra}` : "";
+    return `${header}\n\n${found.body}${argsLine}`;
+  }
+
+  function availableSkillNamesForTab(tab: Tab): string[] {
+    const store = new SkillStore({
+      projectRoot: tab.rootDir,
+      customSkillPaths: loadResolvedSkillPaths(tab.rootDir),
+      subagentModels: loadSubagentModels(),
+    });
+    return store.list().map((s) => s.name);
+  }
+
+  function runBtwOnTab(
+    tab: Tab,
+    question: string,
+    hooks?: {
+      onAnswer?: (answer: string) => void;
+      onError?: (message: string) => void;
+    },
+  ): void {
+    if (!tab.runtime) return;
+    void (async () => {
+      try {
+        const reply = await tab.runtime!.loop.client.chat({
+          model: tab.currentModel,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are answering a side question that is unrelated to the current coding conversation. Answer concisely (1-3 sentences) in plain prose. Do not call tools, do not ask clarifying questions, and do not reference any prior turns.",
+            },
+            { role: "user", content: question },
+          ],
+        });
+        const answer =
+          (typeof reply.content === "string" ? reply.content.trim() : "") || "(no answer)";
+        emit({ type: "$btw_result", question, answer }, tab.id);
+        hooks?.onAnswer?.(answer);
+      } catch (err) {
+        const message = `/btw failed: ${(err as Error).message}`;
+        emit({ type: "$error", message }, tab.id);
+        hooks?.onError?.(message);
+      }
+    })();
+  }
+
+  function handleQQRemoteDesktopCommand(tab: Tab, text: string): boolean {
+    const cmd = parseQQRemoteDesktopCommand(text, availableSkillNamesForTab(tab));
+    if (!cmd) return false;
+    if (tab.aborter && !qqRemoteCommandBypassesBusy(cmd)) {
+      void qqRuntime.channel
+        ?.sendResponse("Session is busy. Wait for the current turn or reply to the pending prompt.")
+        .catch(() => undefined);
+      return true;
+    }
+    switch (cmd.kind) {
+      case "help":
+        sendQQInfo(qqRemoteDesktopHelpText(availableSkillNamesForTab(tab)), tab);
+        return true;
+      case "abort":
+        abortTurn(tab, { discardCurrentTurn: true });
+        cancelPendingGates(tab);
+        sendQQInfo("Stopped the current desktop conversation.", tab);
+        return true;
+      case "new":
+        startNewChatInTab(tab);
+        sendQQInfo("Started a new desktop conversation in the current tab.", tab);
+        return true;
+      case "compact":
+        if (!tab.runtime) {
+          sendQQInfo("Desktop is not configured yet.", tab);
+          return true;
+        }
+        void tab.runtime.loop
+          .compactHistory()
+          .then(() => {
+            emitCtxBreakdown(tab);
+            sendQQInfo("Compacted the current desktop conversation history.", tab);
+          })
+          .catch((err: Error) => {
+            emit({ type: "$error", message: `/compact failed: ${err.message}` }, tab.id);
+            void qqRuntime.channel
+              ?.sendResponse(`/compact failed: ${err.message}`)
+              .catch(() => undefined);
+          });
+        return true;
+      case "btw":
+        if (!tab.runtime) {
+          sendQQInfo("Desktop is not configured yet.", tab);
+          return true;
+        }
+        runBtwOnTab(tab, cmd.text, {
+          onAnswer: (answer) =>
+            void qqRuntime.channel?.sendResponse(`≫ btw\n${answer}`).catch(() => undefined),
+          onError: (message) =>
+            void qqRuntime.channel?.sendResponse(message).catch(() => undefined),
+        });
+        return true;
+      case "skill": {
+        if (!tab.runtime) {
+          sendQQInfo("Desktop is not configured yet.", tab);
+          return true;
+        }
+        const payload = buildSkillPayload(tab, cmd.name, cmd.args);
+        if (!payload) {
+          emit({ type: "$error", message: `skill not found: ${cmd.name}` }, tab.id);
+          void qqRuntime.channel
+            ?.sendResponse(`skill not found: ${cmd.name}`)
+            .catch(() => undefined);
+          return true;
+        }
+        void runTurn(tab, payload, true);
+        return true;
+      }
+      default:
+        return false;
+    }
   }
 
   function parseIndexedChoice(text: string): number {
@@ -1222,6 +1556,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
         if (!tab) return;
         const trimmed = text.trim();
         if (!trimmed) return;
+        if (handleQQRemoteDesktopCommand(tab, trimmed)) return;
         emit(
           {
             type: "user.message",
@@ -1299,6 +1634,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       mcpRuntime: null,
       mcpStatuses: new Map(),
       switching: false,
+      hooks: loadHooks({ projectRoot: dir }),
     };
     tab.currentSession = mintSessionFor(dir);
     tabs.set(tab.id, tab);
@@ -1335,7 +1671,8 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
           emit({ type: "$error", message: `mcp reload failed: ${(err as Error).message}` }, tab.id);
         });
     }
-    const requested = (readConfig().mcp ?? []).length;
+    const allSpecs = getAllMcpSpecs(readConfig());
+    const requested = allSpecs.length;
     if (requested === 0) return Promise.resolve();
     const runtime = createMcpRuntime({
       getTools: () => {
@@ -1350,8 +1687,8 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     tab.mcpRuntime = runtime;
     runtime.setLifecycleSink((notice) => {
       if (notice.kind === "slow") return; // not surfaced in the desktop panel
-      const cfg = readConfig().mcp ?? [];
-      const target = cfg.find((raw) => {
+      const specs = getAllMcpSpecs(readConfig());
+      const target = specs.find((raw) => {
         try {
           return parseMcpSpec(raw).name === notice.name;
         } catch {
@@ -1435,13 +1772,37 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
         }
       }
     }
+    if (tab.hooks.some((h) => h.event === "UserPromptSubmit")) {
+      const report = await runHooks({
+        hooks: tab.hooks,
+        payload: { event: "UserPromptSubmit", cwd: tab.rootDir, prompt: text },
+      });
+      for (const o of report.outcomes) {
+        if (o.decision === "pass") continue;
+        emit({ type: "$error", message: formatHookOutcomeMessage(o) }, tab.id);
+      }
+      if (report.blocked) {
+        tab.aborter = null;
+        emit({ type: "$turn_complete" }, tab.id);
+        if (fromQQ) markQQTurnFinished(qqRuntime.routing, tab.id);
+        return;
+      }
+    }
     await tabContext.run(tab.id, async () => {
       try {
+        let emittedTurnContext = false;
         for await (const ev of rt.loop.step(text)) {
+          if (!emittedTurnContext) {
+            emittedTurnContext = true;
+            emitCtxBreakdown(tab);
+          }
           if (ev.role === "assistant_final" && ev.content) {
             lastAssistantText = ev.content;
           }
           for (const kev of rt.eventizer.consume(ev, rt.ctx)) emit(kev, tab.id);
+          if (ev.role === "assistant_final" || ev.role === "tool") {
+            emitCtxBreakdown(tab);
+          }
           // Memory tools mutate disk state behind the loop's back — the UI
           // panel won't know until we re-emit. Without this the right-hand
           // panel only updates on tab reopen.
@@ -1478,6 +1839,22 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
           }
           emitSessions(tab);
           void emitBalance(tab);
+          if (tab.hooks.some((h) => h.event === "Stop")) {
+            const stopReport = await runHooks({
+              hooks: tab.hooks,
+              payload: {
+                event: "Stop",
+                cwd: tab.rootDir,
+                lastAssistantText,
+                last_assistant_message: lastAssistantText,
+                turn: rt.loop.stats.summary().turns,
+              },
+            });
+            for (const o of stopReport.outcomes) {
+              if (o.decision === "pass") continue;
+              emit({ type: "$error", message: formatHookOutcomeMessage(o) }, tab.id);
+            }
+          }
         }
         if (fromQQ) markQQTurnFinished(qqRuntime.routing, tab.id);
         tab.switching = false;
@@ -1511,6 +1888,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     tab.symbolIndex = null;
     tab.symbolBuilding = null;
     tab.recentMentions.length = 0;
+    tab.hooks = loadHooks({ projectRoot: target });
     tab.currentSession = mintSessionFor(target);
     tab.toolset = await buildCodeToolset({
       rootDir: target,
@@ -1535,9 +1913,9 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     return undefined;
   }
 
-  function abortTurn(tab: Tab, opts: { discardCurrentTurn?: boolean } = {}): void {
+  function abortTurn(tab: Tab, opts: LoopAbortOptions = {}): void {
     tab.aborter?.abort();
-    tab.runtime?.loop.abort(opts.discardCurrentTurn ? { discardCurrentTurn: true } : undefined);
+    tab.runtime?.loop.abort(opts);
   }
 
   function tabSessionLabel(tab: Tab): string {
@@ -2066,6 +2444,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
             // unreadable jsonl — skip re-emit
           }
         }
+        emitCtxBreakdown(t);
       }
       return;
     }
@@ -2094,7 +2473,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     }
 
     if (msg.cmd === "abort") {
-      abortTurn(tab, { discardCurrentTurn: true });
+      abortTurn(tab, desktopUserAbortLoopOptions());
       cancelPendingGates(tab);
       return;
     }
@@ -2161,19 +2540,11 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
         return;
       }
       try {
-        const store = new SkillStore({
-          projectRoot: tab.rootDir,
-          customSkillPaths: loadResolvedSkillPaths(tab.rootDir),
-        });
-        const found = store.read(msg.name);
-        if (!found) {
+        const payload = buildSkillPayload(tab, msg.name, msg.args);
+        if (!payload) {
           emit({ type: "$error", message: `skill not found: ${msg.name}` }, tab.id);
           return;
         }
-        const extra = msg.args?.trim() ?? "";
-        const header = `# Skill: ${found.name}${found.description ? `\n> ${found.description}` : ""}`;
-        const argsLine = extra ? `\n\nArguments: ${extra}` : "";
-        const payload = `${header}\n\n${found.body}${argsLine}`;
         void runTurn(tab, payload);
       } catch (err) {
         emit({ type: "$error", message: `skill_run: ${(err as Error).message}` }, tab.id);
@@ -2202,52 +2573,77 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       }
       return;
     }
-    if (msg.cmd === "session_load") {
+    if (msg.cmd === "session_import") {
       try {
-        const records = loadSessionMessages(msg.name);
-        const backfilledWorkspace = patchSessionWorkspaceIfMissing(msg.name, tab.rootDir);
-        const meta = loadSessionMeta(msg.name);
-        // Only set switching flag when there's a live turn to abort —
-        // otherwise the flag stays true and suppresses the first turn's events (#1217).
-        if (tab.aborter) tab.switching = true;
-        abortTurn(tab);
-        cancelPendingGates(tab);
-        tab.currentSession = msg.name;
-        persistOpenTabs();
-        if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
-        const loadedMessages = buildLoadedMessages(records);
-        // Empty load is a known silent-failure path (file 0 bytes, all
-        // lines malformed, etc.). Log to stderr so a terminal-launched
-        // desktop reports something diagnostic, and emit a $session_empty
-        // event so the UI can surface "loaded but empty" instead of
-        // looking like the click did nothing. Issue #1179.
-        if (loadedMessages.length === 0) {
-          let sizeBytes = 0;
-          try {
-            sizeBytes = statSync(sessionPath(msg.name)).size;
-          } catch {
-            /* file may not exist */
-          }
-          process.stderr.write(
-            `session_load: "${msg.name}" returned 0 messages (file size=${sizeBytes}B) — empty or unreadable jsonl\n`,
-          );
-          emit({ type: "$session_empty", name: msg.name, sizeBytes }, tab.id);
-        }
+        const result = importExternalSession({
+          source: msg.source,
+          path: msg.path,
+          name: msg.name,
+          workspace: tab.rootDir,
+        });
+        emitSessions(tab);
+        loadSessionIntoTab(tab, result.name, {
+          abortTurn,
+          cancelPendingGates,
+          persistOpenTabs,
+        });
+      } catch (err) {
+        emit(
+          { type: "$error", message: `session_import failed: ${(err as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "session_import_scan") {
+      try {
+        emit({ type: "$session_import_sources", apps: discoverExternalSessionApps() }, tab.id);
+      } catch (err) {
+        emit(
+          { type: "$error", message: `session_import_scan failed: ${(err as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "session_import_bulk") {
+      try {
+        const result = importExternalSessions({
+          sources: msg.sources,
+          workspace: tab.rootDir,
+        });
+        emitSessions(tab);
         emit(
           {
-            type: "$session_loaded",
-            name: msg.name,
-            messages: loadedMessages,
-            carryover: {
-              totalCostUsd: meta.totalCostUsd ?? 0,
-              cacheHitTokens: meta.cacheHitTokens ?? 0,
-              cacheMissTokens: meta.cacheMissTokens ?? 0,
-              totalCompletionTokens: meta.totalCompletionTokens ?? 0,
-            },
+            type: "$session_import_result",
+            imported: result.imported,
+            skipped: result.skipped,
+            failed: result.failed,
           },
           tab.id,
         );
-        if (backfilledWorkspace) emitSessions(tab);
+        if (result.latestName) {
+          loadSessionIntoTab(tab, result.latestName, {
+            abortTurn,
+            cancelPendingGates,
+            persistOpenTabs,
+          });
+        }
+      } catch (err) {
+        emit(
+          { type: "$error", message: `session_import_bulk failed: ${(err as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "session_load") {
+      try {
+        loadSessionIntoTab(tab, msg.name, {
+          abortTurn,
+          cancelPendingGates,
+          persistOpenTabs,
+        });
       } catch (err) {
         process.stderr.write(`session_load: "${msg.name}" threw — ${(err as Error).message}\n`);
         emit({ type: "$error", message: `session_load failed: ${(err as Error).message}` }, tab.id);
@@ -2266,13 +2662,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     if (msg.cmd === "new_chat") {
       // Only set switching flag when there's a live turn to abort —
       // otherwise the flag stays true and suppresses the first turn's events (#1217).
-      if (tab.aborter) tab.switching = true;
-      abortTurn(tab);
-      cancelPendingGates(tab);
-      tab.currentSession = mintSessionFor(tab.rootDir);
-      persistOpenTabs();
-      if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
-      emitSessions(tab);
+      startNewChatInTab(tab);
       return;
     }
     if (msg.cmd === "settings_get") {
@@ -2302,11 +2692,46 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
           void switchWorkspace(tab, msg.workspaceDir);
           return;
         }
+        if (msg.recentWorkspaces !== undefined) {
+          const cfg = readConfig();
+          cfg.recentWorkspaces = msg.recentWorkspaces;
+          writeConfig(cfg);
+        }
         if (msg.editor !== undefined) saveEditor(msg.editor);
         if (msg.showSystemEvents !== undefined) saveShowSystemEvents(msg.showSystemEvents);
-        if (msg.webSearchEngine !== undefined) {
+        if (
+          msg.webSearchEngine !== undefined ||
+          msg.webSearchEndpoint !== undefined ||
+          msg.metasoApiKey !== undefined ||
+          msg.tavilyApiKey !== undefined ||
+          msg.perplexityApiKey !== undefined ||
+          msg.exaApiKey !== undefined ||
+          msg.ollamaApiKey !== undefined ||
+          msg.braveApiKey !== undefined
+        ) {
           const cfg = readConfig();
-          cfg.webSearchEngine = msg.webSearchEngine;
+          if (msg.webSearchEngine !== undefined) cfg.webSearchEngine = msg.webSearchEngine;
+          if (msg.webSearchEndpoint !== undefined) {
+            cfg.webSearchEndpoint = msg.webSearchEndpoint?.trim() || undefined;
+          }
+          if (msg.metasoApiKey !== undefined) {
+            cfg.metasoApiKey = msg.metasoApiKey?.trim() || undefined;
+          }
+          if (msg.tavilyApiKey !== undefined) {
+            cfg.tavilyApiKey = msg.tavilyApiKey?.trim() || undefined;
+          }
+          if (msg.perplexityApiKey !== undefined) {
+            cfg.perplexityApiKey = msg.perplexityApiKey?.trim() || undefined;
+          }
+          if (msg.exaApiKey !== undefined) {
+            cfg.exaApiKey = msg.exaApiKey?.trim() || undefined;
+          }
+          if (msg.ollamaApiKey !== undefined) {
+            cfg.ollamaApiKey = msg.ollamaApiKey?.trim() || undefined;
+          }
+          if (msg.braveApiKey !== undefined) {
+            cfg.braveApiKey = msg.braveApiKey?.trim() || undefined;
+          }
           writeConfig(cfg);
         }
         if (msg.subagentModels !== undefined) {
@@ -2528,26 +2953,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       if (!tab.runtime) return;
       const question = msg.text.trim();
       if (!question) return;
-      void (async () => {
-        try {
-          const reply = await tab.runtime!.loop.client.chat({
-            model: tab.currentModel,
-            messages: [
-              {
-                role: "system",
-                content:
-                  "You are answering a side question that is unrelated to the current coding conversation. Answer concisely (1-3 sentences) in plain prose. Do not call tools, do not ask clarifying questions, and do not reference any prior turns.",
-              },
-              { role: "user", content: question },
-            ],
-          });
-          const answer =
-            (typeof reply.content === "string" ? reply.content.trim() : "") || "(no answer)";
-          emit({ type: "$btw_result", question, answer }, tab.id);
-        } catch (err) {
-          emit({ type: "$error", message: `/btw failed: ${(err as Error).message}` }, tab.id);
-        }
-      })();
+      runBtwOnTab(tab, question);
       return;
     }
     if (msg.cmd === "user_input") {

@@ -1,28 +1,35 @@
+import type { Color } from "ink";
+
 export type ThemeName = "dark" | "light" | "midnight" | "deep-blue" | "high-contrast";
 
 export interface ThemeTokens {
   fg: {
-    strong: string;
-    body: string;
-    sub: string;
-    meta: string;
-    faint: string;
+    strong: Color;
+    body: Color;
+    sub: Color;
+    meta: Color;
+    faint: Color;
   };
   tone: {
-    brand: string;
-    accent: string;
-    violet: string;
-    ok: string;
-    warn: string;
-    err: string;
-    info: string;
+    brand: Color;
+    accent: Color;
+    violet: Color;
+    ok: Color;
+    warn: Color;
+    err: Color;
+    info: Color;
   };
   toneActive: ThemeTokens["tone"];
   surface: {
-    bg: string;
-    bgInput: string;
-    bgCode: string;
-    bgElev: string;
+    bg: Color;
+    bgInput: Color;
+    bgCode: Color;
+    bgElev: Color;
+  };
+  messageBg: {
+    user: Color;
+    bash: Color;
+    selected: Color;
   };
   card: Record<
     | "user"
@@ -42,7 +49,7 @@ export interface ThemeTokens {
     | "ctx"
     | "doctor"
     | "branch",
-    { color: string; glyph: string }
+    { color: Color; glyph: string }
   >;
 }
 
@@ -106,6 +113,11 @@ const dark = defineTheme({
     bgCode: "#080c16",
     bgElev: "#151d2f",
   },
+  messageBg: {
+    user: "#373737",
+    bash: "#413c41",
+    selected: "#2c323e",
+  },
 });
 
 const light = defineTheme({
@@ -139,6 +151,11 @@ const light = defineTheme({
     bgInput: "#f1f5f9",
     bgCode: "#f3f4f6",
     bgElev: "#eef2f7",
+  },
+  messageBg: {
+    user: "#e5e7eb",
+    bash: "#f5e0e9",
+    selected: "#dde6f5",
   },
 });
 
@@ -174,6 +191,11 @@ const midnight = defineTheme({
     bgCode: "#16161e",
     bgElev: "#24283b",
   },
+  messageBg: {
+    user: "#2a2d44",
+    bash: "#39304a",
+    selected: "#1f2740",
+  },
 });
 
 const deepBlue = defineTheme({
@@ -208,6 +230,11 @@ const deepBlue = defineTheme({
     bgCode: "#141414",
     bgElev: "#252525",
   },
+  messageBg: {
+    user: "#1c1c2a",
+    bash: "#2a1f2a",
+    selected: "#162033",
+  },
 });
 
 const highContrast = defineTheme({
@@ -241,6 +268,11 @@ const highContrast = defineTheme({
     bgInput: "#0a0a0a",
     bgCode: "#050505",
     bgElev: "#141414",
+  },
+  messageBg: {
+    user: "#1a1a1a",
+    bash: "#241f24",
+    selected: "#102030",
   },
 });
 
@@ -314,6 +346,7 @@ export const FG = proxyTokens((theme) => theme.fg);
 export const TONE = proxyTokens((theme) => theme.tone);
 export const TONE_ACTIVE = proxyTokens((theme) => theme.toneActive);
 export const SURFACE = proxyTokens((theme) => theme.surface);
+export const MESSAGE_BG = proxyTokens((theme) => theme.messageBg);
 export const CARD = proxyTokens((theme) => theme.card);
 
 export type CardTone = keyof ThemeTokens["card"];
@@ -344,7 +377,7 @@ export function formatCost(costUsd: number, currency?: string, fractionDigits = 
 }
 
 /** Threshold color for a wallet balance. USD is converted to CNY before the threshold check. */
-export function balanceColor(amount: number, currency?: string): string {
+export function balanceColor(amount: number, currency?: string): Color {
   const cny = (currency ?? "CNY") === "USD" ? amount * USD_TO_CNY : amount;
   if (cny < 5) return TONE.err;
   if (cny < 20) return TONE.warn;

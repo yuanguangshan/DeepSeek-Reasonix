@@ -1,6 +1,8 @@
 import {
+  loadBraveApiKey,
   loadExaApiKey,
   loadMetasoApiKey,
+  loadOllamaApiKey,
   loadPerplexityApiKey,
   loadTavilyApiKey,
   readConfig,
@@ -17,11 +19,14 @@ export const handlers: Record<string, SlashHandler> = {
     if (
       !engine ||
       (engine !== "bing" &&
+        engine !== "bing-intl" &&
         engine !== "searxng" &&
         engine !== "metaso" &&
         engine !== "tavily" &&
         engine !== "perplexity" &&
-        engine !== "exa")
+        engine !== "exa" &&
+        engine !== "brave" &&
+        engine !== "ollama")
     ) {
       return {
         info: [
@@ -30,12 +35,15 @@ export const handlers: Record<string, SlashHandler> = {
           "",
           t("handlers.webSearchEngine.usageHeader"),
           t("handlers.webSearchEngine.usageBing"),
+          t("handlers.webSearchEngine.usageBingIntl"),
           t("handlers.webSearchEngine.usageSearxng"),
           t("handlers.webSearchEngine.usageSearxngUrl"),
           t("handlers.webSearchEngine.usageMetaso"),
           t("handlers.webSearchEngine.usageTavily"),
           t("handlers.webSearchEngine.usagePerplexity"),
           t("handlers.webSearchEngine.usageExa"),
+          t("handlers.webSearchEngine.usageOllama"),
+          t("handlers.webSearchEngine.usageBrave"),
           "",
           t("handlers.webSearchEngine.alias"),
           "",
@@ -47,16 +55,17 @@ export const handlers: Record<string, SlashHandler> = {
 
     const cfg = readConfig();
 
-    const apiKeyEngines = new Set(["tavily", "perplexity", "exa", "metaso"]);
+    const apiKeyEngines = new Set(["tavily", "perplexity", "exa", "metaso", "ollama", "brave"]);
     if (apiKeyEngines.has(engine)) {
-      const loadKey =
-        engine === "tavily"
-          ? loadTavilyApiKey
-          : engine === "perplexity"
-            ? loadPerplexityApiKey
-            : engine === "exa"
-              ? loadExaApiKey
-              : loadMetasoApiKey;
+      const KEY_LOADERS: Record<string, () => string | undefined> = {
+        tavily: loadTavilyApiKey,
+        perplexity: loadPerplexityApiKey,
+        exa: loadExaApiKey,
+        ollama: loadOllamaApiKey,
+        brave: loadBraveApiKey,
+        metaso: loadMetasoApiKey,
+      };
+      const loadKey = KEY_LOADERS[engine] ?? loadMetasoApiKey;
 
       if (args[1]) {
         cfg.webSearchEngine = engine;
@@ -85,18 +94,6 @@ export const handlers: Record<string, SlashHandler> = {
     }
     writeConfig(cfg);
 
-    const note =
-      engine === "searxng"
-        ? t("handlers.webSearchEngine.switchedSearxngNote", { endpoint: webSearchEndpoint() })
-        : engine === "metaso"
-          ? t("handlers.webSearchEngine.switchedMetasoNote")
-          : engine === "tavily"
-            ? t("handlers.webSearchEngine.switchedTavilyNote")
-            : engine === "perplexity"
-              ? t("handlers.webSearchEngine.switchedPerplexityNote")
-              : engine === "exa"
-                ? t("handlers.webSearchEngine.switchedExaNote")
-                : "";
     const detail =
       engine === "searxng"
         ? t("handlers.webSearchEngine.confirmedDetail", { endpoint: webSearchEndpoint() })

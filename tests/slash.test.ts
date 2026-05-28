@@ -159,17 +159,48 @@ describe("handleSlash", () => {
 
   it("/model switches the model", () => {
     const loop = makeLoop();
-    handleSlash("model", ["deepseek-reasoner"], loop);
-    expect(loop.model).toBe("deepseek-reasoner");
+    const tempDir = mkdtempSync(join(tmpdir(), "reasonix-slash-model-basic-"));
+    const tempConfig = join(tempDir, "config.json");
+    try {
+      handleSlash("model", ["deepseek-reasoner"], loop, { configPath: tempConfig });
+      expect(loop.model).toBe("deepseek-reasoner");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("/model soft-warns when id is not in the fetched catalog but still switches", () => {
-    const loop = makeLoop();
-    const r = handleSlash("model", ["deepseek-made-up"], loop, {
-      models: ["deepseek-chat", "deepseek-reasoner"],
-    });
-    expect(loop.model).toBe("deepseek-made-up");
-    expect(r.info).toMatch(/not in the fetched catalog/);
+    const tempDir = mkdtempSync(join(tmpdir(), "reasonix-slash-model-warn-"));
+    const tempConfig = join(tempDir, "config.json");
+    try {
+      const loop = makeLoop();
+      const r = handleSlash("model", ["deepseek-made-up"], loop, {
+        models: ["deepseek-chat", "deepseek-reasoner"],
+        configPath: tempConfig,
+      });
+      expect(loop.model).toBe("deepseek-made-up");
+      expect(r.info).toMatch(/not in the fetched catalog/);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("/model persists to the provided configPath instead of the user's global config", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "reasonix-slash-model-"));
+    const tempConfig = join(tempDir, "config.json");
+    try {
+      const loop = makeLoop();
+      const r = handleSlash("model", ["deepseek-made-up"], loop, {
+        models: ["deepseek-chat", "deepseek-reasoner"],
+        configPath: tempConfig,
+      });
+      expect(loop.model).toBe("deepseek-made-up");
+      expect(r.info).toMatch(/not in the fetched catalog/);
+      const saved = JSON.parse(readFileSync(tempConfig, "utf8"));
+      expect(saved.model).toBe("deepseek-made-up");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("/model with no arg opens the unified picker (#371)", () => {
@@ -322,6 +353,22 @@ describe("handleSlash", () => {
       codeUndo: () => "▸ restored 2 file(s)",
     });
     expect(r.info).toMatch(/restored 2 file/);
+  });
+
+  it("/undo records reverted edits in model context", () => {
+    const loop = makeLoop();
+    const r = handleSlash("undo", [], loop, {
+      codeUndo: () => ({
+        info: "▸ undo: reverted demo.txt from batch #1",
+        contextEvent: { batchId: 1, source: "auto", paths: ["demo.txt"] },
+      }),
+    });
+
+    expect(r.info).toContain("reverted demo.txt");
+    expect(loop.log.entries.at(-1)).toMatchObject({
+      role: "system",
+      content: expect.stringContaining("The user ran /undo and reverted edit batch #1"),
+    });
   });
 
   it("/help mentions /undo and /commit", () => {
@@ -1530,6 +1577,21 @@ describe("handleSlash", () => {
       const r = handleSlash("lang", ["zh-CN"], makeLoop());
       expect(getLanguage()).toBe("zh-CN");
       expect(r.info).toBe("语言已切换为简体中文。");
+    });
+
+    it("/skill list localizes built-in skill descriptions in Chinese", () => {
+      setLanguageRuntime("zh-CN");
+      const r = handleSlash("skill", ["list"], makeLoop(), { codeRoot: process.cwd() });
+      expect(r.info).toMatch(/用户技能/);
+      expect(r.info).toMatch(/\(builtin\)\s+qq/);
+      expect(r.info).not.toContain("Guide QQ channel setup and troubleshooting");
+    });
+
+    it("/skill qq resolves the builtin qq skill and reports localized run info in Chinese", () => {
+      setLanguageRuntime("zh-CN");
+      const r = handleSlash("skill", ["qq"], makeLoop(), { codeRoot: process.cwd() });
+      expect(r.info).toBe("▸ 正在运行技能：qq");
+      expect(r.resubmit).toContain("# Skill: qq");
     });
 
     it("fires onLanguageChange listeners", () => {

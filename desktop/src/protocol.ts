@@ -111,6 +111,29 @@ export type SessionsEvent = {
   }[];
 };
 
+export type ExternalSessionSource = "claude" | "codex";
+
+export type ExternalSessionApp = {
+  source: ExternalSessionSource;
+  label: string;
+  root: string;
+  available: boolean;
+  sessionCount: number;
+  latestMtime?: string;
+};
+
+export type SessionImportSourcesEvent = {
+  type: "$session_import_sources";
+  apps: ExternalSessionApp[];
+};
+
+export type SessionImportResultEvent = {
+  type: "$session_import_result";
+  imported: number;
+  skipped: number;
+  failed: number;
+};
+
 export type MentionResultsEvent = {
   type: "$mention_results";
   nonce: number;
@@ -273,13 +296,8 @@ export type EditMode = "review" | "auto" | "yolo" | "plan";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
 
-export type WebSearchEngineName =
-  | "bing"
-  | "searxng"
-  | "metaso"
-  | "tavily"
-  | "perplexity"
-  | "exa";
+export type WebSearchEngineName = "bing" | "bing-intl" | "searxng" | "metaso" | "tavily" | "perplexity" | "exa"
+  | "brave" | "ollama";
 
 export type SettingsEvent = {
   type: "$settings";
@@ -293,6 +311,15 @@ export type SettingsEvent = {
   model: string;
   editor?: string;
   webSearchEngine?: WebSearchEngineName;
+  webSearchEndpoint?: string;
+  webSearchApiKeys?: {
+    metaso?: string;
+    tavily?: string;
+    perplexity?: string;
+    exa?: string;
+    ollama?: string;
+    brave?: string;
+  };
   subagentModels?: Record<string, "flash" | "pro">;
   showSystemEvents?: boolean;
   version: string;
@@ -311,11 +338,19 @@ export type QQSettingsEvent = {
   access: string;
 };
 
+export type BalanceInfoItem = {
+  currency: string;
+  total: number;
+  granted?: number;
+  toppedUp?: number;
+};
+
 export type BalanceEvent = {
   type: "$balance";
   currency: string;
   total: number;
   isAvailable: boolean;
+  balanceInfos: BalanceInfoItem[];
 };
 
 export type SettingsPatch = {
@@ -324,9 +359,17 @@ export type SettingsPatch = {
   budgetUsd?: number | null;
   baseUrl?: string;
   workspaceDir?: string;
+  recentWorkspaces?: string[];
   model?: string;
   editor?: string;
   webSearchEngine?: WebSearchEngineName;
+  webSearchEndpoint?: string | null;
+  metasoApiKey?: string | null;
+  tavilyApiKey?: string | null;
+  perplexityApiKey?: string | null;
+  exaApiKey?: string | null;
+  ollamaApiKey?: string | null;
+  braveApiKey?: string | null;
   subagentModels?: Record<string, "flash" | "pro">;
   showSystemEvents?: boolean;
 };
@@ -447,6 +490,8 @@ export type IncomingEvent = { tabId?: string } & (
   | ChoiceRequiredEvent
   | PlanRequiredEvent
   | SessionsEvent
+  | SessionImportSourcesEvent
+  | SessionImportResultEvent
   | SessionLoadedEvent
   | SessionEmptyEvent
   | NeedsSetupEvent
@@ -493,6 +538,9 @@ export type OutgoingCommand = { tabId?: string } & (
   | { cmd: "session_delete"; name: string }
   | { cmd: "session_load"; name: string }
   | { cmd: "session_rename"; name: string; title: string }
+  | { cmd: "session_import"; source: ExternalSessionSource; path: string; name?: string }
+  | { cmd: "session_import_scan" }
+  | { cmd: "session_import_bulk"; sources: ExternalSessionSource[] }
   | { cmd: "memory_read"; path: string }
   | { cmd: "new_chat" }
   | { cmd: "setup_save_key"; key: string }

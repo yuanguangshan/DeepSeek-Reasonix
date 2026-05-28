@@ -88,6 +88,17 @@ export type RevisionRequiredEvent = {
 
 export type RevisionVerdict = { type: "accepted" } | { type: "rejected" } | { type: "cancelled" };
 
+export type ModalKind =
+  | "shell"
+  | "path"
+  | "choice"
+  | "plan"
+  | "checkpoint"
+  | "revision"
+  | "edit-review";
+
+export type ModalDismissedEvent = { type: "$modal_dismissed"; kind: ModalKind };
+
 export type StepCompletedEvent = {
   type: "$step_completed";
   stepId: string;
@@ -100,6 +111,7 @@ export type PlanClearedEvent = { type: "$plan_cleared" };
 
 export type SessionsEvent = {
   type: "$sessions";
+  currentSession?: string | null;
   items: {
     name: string;
     messageCount: number;
@@ -107,6 +119,15 @@ export type SessionsEvent = {
     summary?: string;
     workspaceStatus?: "matched" | "legacy_missing_meta";
   }[];
+};
+
+export type SessionUsageEvent = {
+  type: "$session_usage";
+  totalCostUsd: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
 };
 
 export type MentionResultsEvent = {
@@ -270,11 +291,14 @@ export type ReasoningEffort = "low" | "medium" | "high" | "max";
 
 export type WebSearchEngineName =
   | "bing"
+  | "bing-intl"
   | "searxng"
   | "metaso"
   | "tavily"
   | "perplexity"
-  | "exa";
+  | "exa"
+  | "brave"
+  | "ollama";
 
 export type SettingsEvent = {
   type: "$settings";
@@ -319,6 +343,7 @@ export type SettingsPatch = {
   budgetUsd?: number | null;
   baseUrl?: string;
   workspaceDir?: string;
+  recentWorkspaces?: string[];
   model?: string;
   editor?: string;
   webSearchEngine?: WebSearchEngineName;
@@ -442,6 +467,7 @@ export type IncomingEvent = { tabId?: string } & (
   | ChoiceRequiredEvent
   | PlanRequiredEvent
   | SessionsEvent
+  | SessionUsageEvent
   | SessionLoadedEvent
   | SessionEmptyEvent
   | NeedsSetupEvent
@@ -450,6 +476,7 @@ export type IncomingEvent = { tabId?: string } & (
   | BalanceEvent
   | CheckpointRequiredEvent
   | RevisionRequiredEvent
+  | ModalDismissedEvent
   | StepCompletedEvent
   | PlanClearedEvent
   | MentionResultsEvent
@@ -479,7 +506,7 @@ export type IncomingEvent = { tabId?: string } & (
 export type OutgoingCommand = { tabId?: string } & (
   | { cmd: "user_input"; text: string }
   | { cmd: "abort" }
-  | { cmd: "confirm_response"; id: number; response: ConfirmationChoice }
+  | { cmd: "confirm_response"; id: number; response: ConfirmationChoice; kind: "shell" | "path" }
   | { cmd: "choice_response"; id: number; response: ChoiceVerdict }
   | { cmd: "plan_response"; id: number; response: PlanVerdict }
   | { cmd: "checkpoint_response"; id: number; response: CheckpointVerdict }

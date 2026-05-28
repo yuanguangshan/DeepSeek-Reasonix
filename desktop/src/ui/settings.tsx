@@ -1,3 +1,4 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { type ReactNode, useEffect, useState } from "react";
 import type { Balance, Settings as SettingsType, UsageStats } from "../App";
 import { getLangLabel, getSupportedLangs, setLang, t, useLang } from "../i18n";
@@ -635,7 +636,7 @@ function PageGeneral({
             value={editorDraft}
             placeholder="cursor --goto"
             onChange={(e) => setEditorDraft(e.target.value)}
-            onBlur={() => onSave({ editor: editorDraft || undefined })}
+            onBlur={() => onSave({ editor: editorDraft.trim() })}
           />
         </div>
       </section>
@@ -728,24 +729,175 @@ function PageGeneral({
               onSave({
                 webSearchEngine: e.target.value as
                   | "bing"
+                  | "bing-intl"
                   | "searxng"
                   | "metaso"
                   | "tavily"
                   | "perplexity"
-                  | "exa",
+                  | "exa"
+                  | "brave"
+                  | "ollama",
               })
             }
           >
             <option value="bing">{t("settings.webSearchEngineBing")}</option>
+            <option value="bing-intl">{t("settings.webSearchEngineBingIntl")}</option>
             <option value="searxng">{t("settings.webSearchEngineSearxng")}</option>
             <option value="metaso">{t("settings.webSearchEngineMetaso")}</option>
             <option value="tavily">{t("settings.webSearchEngineTavily")}</option>
             <option value="perplexity">{t("settings.webSearchEnginePerplexity")}</option>
             <option value="exa">{t("settings.webSearchEngineExa")}</option>
+            <option value="brave">{t("settings.webSearchEngineBrave")}</option>
+            <option value="ollama">{t("settings.webSearchEngineOllama")}</option>
           </select>
         </div>
+        <WebSearchEngineCredentials settings={settings} onSave={onSave} />
       </section>
     </>
+  );
+}
+
+const SEARCH_ENGINE_API_KEY_FIELDS: ReadonlyArray<{
+  engine: "metaso" | "tavily" | "perplexity" | "exa" | "brave" | "ollama";
+  patchKey: "metasoApiKey" | "tavilyApiKey" | "perplexityApiKey" | "exaApiKey" | "braveApiKey" | "ollamaApiKey";
+  signupUrl: string;
+}> = [
+  { engine: "metaso", patchKey: "metasoApiKey", signupUrl: "https://metaso.cn/settings/api" },
+  { engine: "tavily", patchKey: "tavilyApiKey", signupUrl: "https://app.tavily.com" },
+  {
+    engine: "perplexity",
+    patchKey: "perplexityApiKey",
+    signupUrl: "https://www.perplexity.ai/settings/api",
+  },
+  { engine: "exa", patchKey: "exaApiKey", signupUrl: "https://dashboard.exa.ai/api-keys" },
+  { engine: "brave", patchKey: "braveApiKey", signupUrl: "https://brave.com/search/api/" },
+  { engine: "ollama", patchKey: "ollamaApiKey", signupUrl: "https://ollama.com/settings/keys" },
+];
+
+function WebSearchEngineCredentials({
+  settings,
+  onSave,
+}: {
+  settings: SettingsType;
+  onSave: (patch: SettingsPatch) => void;
+}) {
+  const engine = settings.webSearchEngine ?? "bing";
+  if (engine === "bing" || engine === "bing-intl") return null;
+  if (engine === "searxng") {
+    return <SearxngEndpointRow settings={settings} onSave={onSave} />;
+  }
+  const field = SEARCH_ENGINE_API_KEY_FIELDS.find((f) => f.engine === engine);
+  if (!field) return null;
+  const prefix = settings.webSearchApiKeys?.[engine];
+  return (
+    <WebSearchApiKeyRow
+      engine={engine}
+      patchKey={field.patchKey}
+      signupUrl={field.signupUrl}
+      prefix={prefix}
+      onSave={onSave}
+    />
+  );
+}
+
+function SearxngEndpointRow({
+  settings,
+  onSave,
+}: {
+  settings: SettingsType;
+  onSave: (patch: SettingsPatch) => void;
+}) {
+  const [draft, setDraft] = useState(settings.webSearchEndpoint ?? "");
+  useEffect(() => {
+    setDraft(settings.webSearchEndpoint ?? "");
+  }, [settings.webSearchEndpoint]);
+  return (
+    <div className="setting-row">
+      <div className="l">
+        <div className="n">{t("settings.webSearchEndpoint")}</div>
+        <div className="h">{t("settings.webSearchEndpointHint")}</div>
+      </div>
+      <input
+        className="field mono"
+        value={draft}
+        placeholder="http://localhost:8080"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const next = draft.trim();
+          if (next === (settings.webSearchEndpoint ?? "")) return;
+          onSave({ webSearchEndpoint: next || null });
+        }}
+      />
+    </div>
+  );
+}
+
+function WebSearchApiKeyRow({
+  engine,
+  patchKey,
+  signupUrl,
+  prefix,
+  onSave,
+}: {
+  engine: "metaso" | "tavily" | "perplexity" | "exa" | "brave" | "ollama";
+  patchKey: "metasoApiKey" | "tavilyApiKey" | "perplexityApiKey" | "exaApiKey" | "braveApiKey" | "ollamaApiKey";
+  signupUrl: string;
+  prefix?: string;
+  onSave: (patch: SettingsPatch) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const label = t(`settings.webSearchApiKey.${engine}` as const);
+  return (
+    <div className="setting-row">
+      <div className="l">
+        <div className="n">{label}</div>
+        <div className="h">
+          {prefix ? t("settings.apiKeySet", { prefix }) : t("settings.apiKeyNotSet")}{" "}
+          <a
+            href={signupUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => {
+              e.preventDefault();
+              void openUrl(signupUrl).catch(() => undefined);
+            }}
+          >
+            {t("settings.webSearchApiKeySignup")}
+          </a>
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input
+          className="field mono"
+          type="password"
+          value={draft}
+          placeholder={prefix ?? ""}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <button
+          type="button"
+          className="btn primary"
+          disabled={!draft.trim()}
+          onClick={() => {
+            const trimmed = draft.trim();
+            if (!trimmed) return;
+            onSave({ [patchKey]: trimmed } as SettingsPatch);
+            setDraft("");
+          }}
+        >
+          {t("settings.apiKeySave")}
+        </button>
+        {prefix ? (
+          <button
+            type="button"
+            className="btn"
+            onClick={() => onSave({ [patchKey]: null } as SettingsPatch)}
+          >
+            {t("settings.webSearchApiKeyClear")}
+          </button>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -805,7 +957,7 @@ function ApiKeySection({
           className="field mono"
           value={urlDraft}
           onChange={(e) => setUrlDraft(e.target.value)}
-          onBlur={() => onSave({ baseUrl: urlDraft.trim() || undefined })}
+          onBlur={() => onSave({ baseUrl: urlDraft.trim() })}
         />
       </div>
     </section>

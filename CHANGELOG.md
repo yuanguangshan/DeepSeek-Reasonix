@@ -3,6 +3,59 @@
 All notable changes to Reasonix. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] — 2026-05-26
+
+**Ink renderer in-tree as `@esengine/ink`.** The vendored Ink fork now
+lives as a workspace package (#1847), unblocking TUI-specific
+renderer tweaks (focus, IME, Static append) without forking upstream.
+TUI polish lands on top: guard ASCII IME enter commits so JP/CN IME
+atomic commits don't double-submit (#1874), preserve undo state across
+session context switches (#1810), incremental repaint coverage
+(#1873).
+
+**Desktop — clipboard image paste.** Paste screenshots / copied images
+directly into the composer (#1889); paste path hardened against
+oversized + non-image clipboard payloads (#1897). Sessions exported by
+other local AI apps can be imported into Reasonix (#1894).
+
+**Desktop — JumpBar polish + drag perf.** JumpBar now highlights the
+active message bar and follows the latest one as the thread grows
+(#1813); dot styling pulled into a shared helper (#1892). Sidebar drag
+writes CSS vars directly to the DOM with `content-visibility` on
+messages (#1812) and unit-suffixes the vars to dodge a Chromium
+recompute storm (#1875).
+
+**Desktop — smaller fixes.**
+- Search-engine API key UI + slash command interception (#1867)
+- Mention `@` popup stays stable while filtering (#1850); split
+  kind/length effects in the popup (#1859)
+- Update banner floats above the thread instead of pushing layout
+  (#1865)
+- `memoryDetail` / `onReadMemory` wired through test fixtures so the
+  desktop memory browser is exercisable in unit tests
+
+**Config — base URL + proxy.** `DEEPSEEK_API_BASE_URL` accepted as an
+env alias to the existing base-url override (#1876, #1887), and
+`proxy.url` is now a first-class field in `config.json` (#1881). MCP
+`initialize` no longer leaks LSP-only fields that some servers reject
+(#1861).
+
+**Providers.** Ollama usage parsing tolerates the field-name variants
+recent Ollama versions emit (#1886).
+
+**i18n.**
+- Russian (`ru`) language pack added (#1879)
+- German corrections — capitalization, terminology, coverage (#1878)
+- `/qq` command hints + argsHint localized; English fallback for
+  zh-CN (#1857, #1862)
+
+**Dashboard / UI.**
+- Sync TUI and Web modal state so confirm gate doesn't desync between
+  surfaces (#1831, #1866)
+- Highlight active plan edit mode (#1863)
+- `useEditHistory` no longer re-exports undo-context through itself
+  (#1854)
+
 ## [0.51.0] — 2026-05-25
 
 **First paint — session restore 4.5s → 430ms.** Progressive `<Static>`

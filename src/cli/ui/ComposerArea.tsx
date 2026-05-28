@@ -20,6 +20,7 @@ import { SlashSuggestions } from "./SlashSuggestions.js";
 
 import { StatusRow } from "./layout/StatusRow.js";
 import { formatLoopStatus } from "./loop.js";
+import { useSlowTick } from "./ticker.js";
 
 import type { StatusBarConfig } from "./layout/StatusRow.js";
 
@@ -167,15 +168,11 @@ function LoopStatusRow({
 }: {
   loop: { prompt: string; intervalMs: number; nextFireAt: number; iter: number };
 }) {
-  const [, setTick] = React.useState(0);
-  React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
+  useSlowTick();
   const nextFireMs = Math.max(0, loop.nextFireAt - Date.now());
   return (
     <Box>
-      <Text color="cyan">
+      <Text color="ansi:cyan">
         {`loop: ${formatLoopStatus(loop.prompt, nextFireMs, loop.iter)} — /loop stop or type to cancel`}
       </Text>
     </Box>

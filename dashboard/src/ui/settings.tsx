@@ -669,20 +669,26 @@ function PageGeneral({
               onSave({
                 webSearchEngine: e.target.value as
                   | "bing"
+                  | "bing-intl"
                   | "searxng"
                   | "metaso"
                   | "tavily"
                   | "perplexity"
-                  | "exa",
+                  | "exa"
+                  | "brave"
+                  | "ollama",
               })
             }
           >
             <option value="bing">{t("settings.webSearchEngineBing")}</option>
+            <option value="bing-intl">{t("settings.webSearchEngineBingIntl")}</option>
             <option value="searxng">{t("settings.webSearchEngineSearxng")}</option>
             <option value="metaso">{t("settings.webSearchEngineMetaso")}</option>
             <option value="tavily">{t("settings.webSearchEngineTavily")}</option>
             <option value="perplexity">{t("settings.webSearchEnginePerplexity")}</option>
             <option value="exa">{t("settings.webSearchEngineExa")}</option>
+            <option value="brave">{t("settings.webSearchEngineBrave")}</option>
+            <option value="ollama">{t("settings.webSearchEngineOllama")}</option>
           </select>
         </div>
       </section>

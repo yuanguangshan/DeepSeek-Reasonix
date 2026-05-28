@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { useMemo, useState } from "react";
 import type { SessionFile, Settings, UsageStats } from "../App";
+import { Markdown } from "../Markdown";
 import { t, useLang } from "../i18n";
 import { I } from "../icons";
 import type { McpSpecInfo, MemoryDetail, MemoryEntryInfo } from "../protocol";
@@ -35,8 +36,10 @@ export function ContextPanel({
   const reserved = usage.reservedTokens;
   const lastHit = usage.lastCallCacheHit ?? 0;
   const lastMiss = usage.lastCallCacheMiss ?? 0;
-  const cached = Math.max(0, lastHit - reserved);
-  const used = Math.max(0, lastMiss - Math.max(0, reserved - lastHit));
+  const observedLog = Math.max(0, lastHit + lastMiss - reserved);
+  const logTokens = Math.max(usage.liveLogTokens, observedLog);
+  const cached = Math.min(logTokens, Math.max(0, lastHit - reserved));
+  const used = Math.max(0, logTokens - cached);
   const reservedPct = Math.min(100, (reserved / CONTEXT_MAX_TOKENS) * 100);
   const usedPct = Math.min(100, (used / CONTEXT_MAX_TOKENS) * 100);
   const cachedPct = Math.min(100, (cached / CONTEXT_MAX_TOKENS) * 100);
@@ -59,7 +62,7 @@ export function ContextPanel({
       </div>
 
       <div className="ctx-body">
-        <div className="ctx-block">
+        <div className="ctx-block ctx-body-tokens">
           <div className="h">
             <span>{t("contextPanel.contextTokens")}</span>
             <span className="right">
@@ -91,14 +94,16 @@ export function ContextPanel({
           </div>
         </div>
 
-        <PanelErrorBoundary key={tab} label={tab}>
-          {tab === "files" && <CtxFiles files={sessionFiles} settings={settings} />}
-          {tab === "tools" && <CtxTools specs={mcpSpecs} bridged={mcpBridged} />}
-          {tab === "memory" && (
-            <CtxMemory entries={memory} detail={memoryDetail} onRead={onReadMemory} />
-          )}
-          {tab === "rules" && <CtxRules settings={settings} />}
-        </PanelErrorBoundary>
+        <div className="ctx-body-tab">
+          <PanelErrorBoundary key={tab} label={tab}>
+            {tab === "files" && <CtxFiles files={sessionFiles} settings={settings} />}
+            {tab === "tools" && <CtxTools specs={mcpSpecs} bridged={mcpBridged} />}
+            {tab === "memory" && (
+              <CtxMemory entries={memory} detail={memoryDetail} onRead={onReadMemory} />
+            )}
+            {tab === "rules" && <CtxRules settings={settings} />}
+          </PanelErrorBoundary>
+        </div>
       </div>
     </aside>
   );
@@ -110,11 +115,14 @@ type TreeNode =
 
 async function openContextFile(path: string, settings: Settings | null): Promise<void> {
   const workspaceDir = settings?.workspaceDir;
-  const sep = workspaceDir?.includes("\\") ? "\\" : "/";
+  const isWindows = workspaceDir?.includes("\\") ?? false;
+  const sep = isWindows ? "\\" : "/";
   const abs =
     workspaceDir && !/^[a-zA-Z]:[\\/]/.test(path) && !path.startsWith("/")
-      ? `${workspaceDir.replace(/[\\/]$/, "")}${sep}${path.replace(/^[\\/]+/, "")}`
-      : path;
+      ? `${workspaceDir.replace(/[\\/]$/, "")}${sep}${path.replace(/^[\\/]+/, "").replace(/\//g, sep)}`
+      : isWindows
+        ? path.replace(/\//g, "\\")
+        : path;
   const editor = settings?.editor?.trim();
   if (editor) {
     await invoke("open_in_editor", { command: editor, path: abs, line: null });
@@ -299,7 +307,7 @@ function CtxMemory({
   onRead: (path: string) => void;
 }) {
   return (
-    <div className="ctx-block">
+    <div className="ctx-block" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <div className="h">
         <span>{t("contextPanel.memoryTitle")}</span>
         <span className="right">
@@ -309,22 +317,28 @@ function CtxMemory({
       {entries.length === 0 ? (
         <div className="ctx-empty">{t("contextPanel.noMemoriesMsg")}</div>
       ) : (
-        <div className="mem">
-          {entries.map((m) => (
-            <button
-              type="button"
-              className="mem-row"
-              data-active={detail?.path === m.path}
-              key={m.path}
-              onClick={() => onRead(m.path)}
-            >
-              <span className="scope" data-s={m.scope}>
-                {m.scope === "project" ? t("contextPanel.scopeProject") : t("contextPanel.scopeGlobal")}
-              </span>
-              <span className="txt">{m.description || m.name}</span>
-            </button>
-          ))}
-          {detail ? <pre className="mem-detail">{detail.body}</pre> : null}
+        <div className="mem" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+          <div style={{ flexShrink: 0 }}>
+            {entries.map((m) => (
+              <button
+                type="button"
+                className="mem-row"
+                data-active={detail?.path === m.path}
+                key={m.path}
+                onClick={() => onRead(m.path)}
+              >
+                <span className="scope" data-s={m.scope}>
+                  {m.scope === "project" ? t("contextPanel.scopeProject") : t("contextPanel.scopeGlobal")}
+                </span>
+                <span className="txt">{m.description || m.name}</span>
+              </button>
+            ))}
+          </div>
+          {detail ? (
+            <div className="mem-detail">
+              <Markdown source={detail.body} />
+            </div>
+          ) : null}
         </div>
       )}
     </div>

@@ -46,11 +46,14 @@ function parseBody(raw: string): SettingsBody {
 
 const VALID_WEB_SEARCH_ENGINES = new Set([
   "bing",
+  "bing-intl",
   "searxng",
   "metaso",
   "tavily",
   "perplexity",
   "exa",
+  "brave",
+  "ollama",
 ]);
 
 const VALID_EDIT_MODES = new Set(["review", "auto", "yolo", "plan"]);
@@ -179,17 +182,21 @@ export async function handleSettings(
         return {
           status: 400,
           body: {
-            error: "webSearchEngine must be bing | searxng | metaso | tavily | perplexity | exa",
+            error:
+              "webSearchEngine must be bing | bing-intl | searxng | metaso | tavily | perplexity | exa | brave | ollama",
           },
         };
       }
       cfg.webSearchEngine = fields.webSearchEngine as
         | "bing"
+        | "bing-intl"
         | "searxng"
         | "metaso"
         | "tavily"
         | "perplexity"
-        | "exa";
+        | "exa"
+        | "brave"
+        | "ollama";
       changed.push("webSearchEngine");
     }
     let modelPendingLive: string | null = null;
